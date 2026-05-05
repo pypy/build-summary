@@ -1,41 +1,59 @@
 {% extends "layout.html" %}
 {% block content %}
-<h2><a href="/builders/{{ builder }}">{{ builder }}</a> #{{ number }}</h2>
-<p>Revision: {{ revision }} &nbsp; Branch: {{ branch }}</p>
-<p>Started: {{ started_fmt }} &nbsp; Duration: {{ duration }}</p>
-<table class="results">
-<tr><th>Step</th><th>Result</th><th>Logs</th></tr>
+<h1>Builder <a href="/builders/{{ builder }}">{{ builder }}</a> Build #{{ number }}</h1>
+
+<div class="column">
+
+<h2>Results:</h2>
+<p class="{{ result_css }} result"><b>{{ result_text }}</b></p>
+
+<h2>SourceStamp:</h2>
+<table class="info" width="100%">
+{% if branch %}<tr><td class="left">Branch</td><td>{{ branch }}</td></tr>{% endif %}
+{% if revision %}<tr class="alt"><td class="left">Revision</td><td>{{ revision }}</td></tr>{% endif %}
+</table>
+
+{% if slave %}<h2>BuildSlave:</h2><p>{{ slave }}</p>{% endif %}
+{% if reason %}<h2>Reason:</h2><p>{{ reason }}</p>{% endif %}
+
+<h2>Steps and Logfiles:</h2>
+<ol>
 {% for step in steps %}
-<tr>
-  <td>{{ step.name }}</td>
-  <td class="result {{ step.css }}">{{ step.result_text }}</td>
-  <td>
-    {% for logname, path in step.logs %}
-    <a href="/logs/{{ path }}">{{ logname }}</a>&nbsp;
-    {% endfor %}
-  </td>
-</tr>
+  <li>
+    <div class="{{ step.css }} result">
+      {{ step.name }}{% if step.text %} {{ step.text }}{% endif %}
+      &nbsp;<span style="float:right">{% if step.duration %}( {{ step.duration }} ){% endif %}</span>
+    </div>
+    <ol>
+      {% for log in step.logs %}
+        <li><a href="{{ log.url }}">{{ log.name }}</a></li>
+      {% else %}
+        <li>- no logs -</li>
+      {% endfor %}
+    </ol>
+  </li>
+{% endfor %}
+</ol>
+
+</div>
+<div class="column">
+
+<h2>Build Properties:</h2>
+<table class="info" width="100%">
+<tr><th>Name</th><th>Value</th><th>Source</th></tr>
+{% for p in props %}
+  <tr class="{{ loop.cycle('alt', '') }}">
+    <td class="left">{{ p.name }}</td><td>{{ p.value }}</td><td>{{ p.source }}</td>
+  </tr>
 {% endfor %}
 </table>
 
-{% if outcomes %}
-<h3>Test outcomes</h3>
-<table class="results">
-<tr><th>Test</th><th>Outcome</th></tr>
-{% for o in outcomes %}
-{% if o.outcome != '.' %}
-<tr>
-  <td>{{ o.test_name }}</td>
-  <td class="result {{ o.css }}">
-    {% if o.outcome in ('F', '!') %}
-    <a href="/longrepr/{{ build_id }}/{{ o.test_name_enc }}">{{ o.outcome }}</a>
-    {% else %}
-    {{ o.outcome }}
-    {% endif %}
-  </td>
-</tr>
-{% endif %}
-{% endfor %}
+<h2>Timing:</h2>
+<table class="info" width="100%">
+  <tr class="alt"><td class="left">Start</td><td>{{ started_fmt }}</td></tr>
+  <tr><td class="left">Elapsed</td><td>{{ duration }}</td></tr>
 </table>
-{% endif %}
+
+</div>
+<br style="clear:both"/>
 {% endblock %}

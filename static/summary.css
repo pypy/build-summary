@@ -27,16 +27,24 @@ td.box {
 
 /* LastBuild, BuildStep states */
 .success {
-	background-color: #72ff75;
+	color: #000;
+	background-color: #8d4;
+	border-color: #4F8530;
 }
 .failure {
-	background-color: red;
+	color: #000;
+	background-color: #e88;
+	border-color: #A77272;
 }
 .warnings {
-	background-color: #ff8000;
+	color: #fff;
+	background-color: #fa3;
+	border-color: #C29D46;
 }
 .exception {
-	background-color: #c000c0;
+	color: #fff;
+	background-color: #c6c;
+	border-color: #ACA0B3;
 }
 .start,.running {
 	background-color: yellow;
@@ -118,3 +126,16 @@ a.failSummary.builderquery, a:visited.failSummary.builderquery {
 a.failSummary.builder, a:visited.failSummary.builder {
     color: grey;
 }
+td.separator { text-align: center; color: #aaa; padding: 0 2px; }
+
+/* Build detail layout */
+div.column { margin: 0 2em 2em 0; float: left; }
+table.info { border-spacing: 1px; }
+table.info td { padding: 0.1em 1em; text-align: center; }
+table.info th { padding: 0.2em 1.5em; text-align: center; }
+table.info td.left { text-align: left; }
+.alt { background-color: #f6f6f6; }
+li { padding: 0.1em 1em; }
+.result { padding: 0.3em 1em; }
+table.results th { text-align: right; padding-right: 0.5em; }
+table.results td { padding: 0.1em 0.5em; }

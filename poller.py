@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import sqlite3
@@ -60,31 +61,87 @@ def set_last_build(db, builder, number):
     )
 
 
-def insert_build(db, builder, number, revision, branch, started, finished, result):
+def insert_build(db, builder, number, revision, branch, started, finished, result, slave, reason):
     cur = db.execute(
         """
-        INSERT INTO builds(builder, number, revision, branch, started, finished, result)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO builds(builder, number, revision, branch, started, finished, result, slave, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(builder, number) DO UPDATE SET
             revision = excluded.revision,
             branch   = excluded.branch,
             started  = excluded.started,
             finished = excluded.finished,
-            result   = excluded.result
+            result   = excluded.result,
+            slave    = excluded.slave,
+            reason   = excluded.reason
         RETURNING id
         """,
-        (builder, number, revision, branch, started, finished, result),
+        (builder, number, revision, branch, started, finished, result, slave, reason),
     )
     return cur.fetchone()["id"]
 
 
-def insert_outcomes(db, build_id, outcomes):
+def insert_steps(db, build_id, steps):
     db.executemany(
         """
-        INSERT OR IGNORE INTO outcomes(build_id, test_name, outcome, longrepr)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO steps(build_id, step_number, name, text, log_names, result, started, finished)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(build_id, step_number) DO UPDATE SET
+            text      = excluded.text,
+            log_names = excluded.log_names,
+            result    = excluded.result,
+            started   = excluded.started,
+            finished  = excluded.finished
         """,
-        [(build_id, name, outcome, longrepr) for name, outcome, longrepr in outcomes],
+        [(build_id, s["step_number"], s["name"],
+          " ".join(s["text"]) if s.get("text") else None,
+          json.dumps([l[0] for l in s.get("logs", [])]),
+          s["results"][0] if s.get("results") and s["results"][0] is not None else None,
+          s["times"][0], s["times"][1])
+         for s in steps],
+    )
+
+
+def insert_properties(db, build_id, properties):
+    import json
+    db.executemany(
+        "INSERT OR IGNORE INTO properties(build_id, name, value, source) VALUES (?, ?, ?, ?)",
+        [(build_id, name, json.dumps(value) if not isinstance(value, str) else value, source)
+         for name, value, source in properties],
+    )
+
+
+def get_or_create_test_name_ids(db, names):
+    """Return {name: id} for all given test names, inserting missing ones."""
+    if not names:
+        return {}
+    placeholders = ",".join("?" * len(names))
+    names = list(names)
+    db.executemany(
+        "INSERT OR IGNORE INTO test_names(name) VALUES (?)",
+        [(n,) for n in names],
+    )
+    rows = db.execute(
+        f"SELECT id, name FROM test_names WHERE name IN ({placeholders})", names
+    ).fetchall()
+    return {row["name"]: row["id"] for row in rows}
+
+
+def insert_outcomes(db, build_id, outcomes):
+    outcomes = list(outcomes)
+    pass_count = sum(1 for _, o, _ in outcomes if o == ".")
+    non_passing = [(n, o, r) for n, o, r in outcomes if o != "."]
+    name_to_id = get_or_create_test_name_ids(db, [n for n, _, _ in non_passing])
+    db.executemany(
+        """
+        INSERT OR IGNORE INTO outcomes(build_id, test_name_id, outcome)
+        VALUES (?, ?, ?)
+        """,
+        [(build_id, name_to_id[name], outcome) for name, outcome, _ in non_passing],
+    )
+    db.execute(
+        "UPDATE builds SET tests_pass = ? WHERE id = ?",
+        (pass_count, build_id),
     )
 
 
@@ -171,10 +228,27 @@ def fetch_log_text(builder, number, step, log_name):
     return r.text
 
 
-def save_log_file(log_root, builder, number, step, log_name, text):
+def fetch_log_html(builder, number, step, log_name):
+    """Fetch the full HTML log page (includes header spans with command/env/exit code)."""
+    url = f"{BUILDBOT_URL}/builders/{builder}/builds/{number}/steps/{step}/logs/{log_name}"
+    r = requests.get(url, timeout=REQUEST_TIMEOUT)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    # Replace the relative CSS reference with buildbot's absolute URL
+    html = r.text.replace(
+        'href="../../../../../../../default.css"',
+        f'href="{BUILDBOT_URL}/default.css"',
+    )
+    # Remove the "view as text" link since we're the viewer
+    html = html.replace('<a href="stdio/text">(view as text)</a><br/>', '')
+    return html
+
+
+def save_log_file(log_root, builder, number, step, log_name, text, ext=".txt"):
     dir_path = os.path.join(log_root, builder, str(number), step)
     os.makedirs(dir_path, exist_ok=True)
-    file_path = os.path.join(dir_path, log_name + ".txt")
+    file_path = os.path.join(dir_path, log_name + ext)
     with open(file_path, "w", encoding="utf-8", errors="replace") as f:
         f.write(text)
     # Return path relative to log_root for storage in DB
@@ -203,32 +277,38 @@ def process_build(db, log_root, builder, build_data):
     props = build_data.get("properties", [])
     revision = extract_property(props, "got_revision") or extract_property(props, "revision") or ""
     branch = extract_property(props, "branch") or ""
+    slave = extract_property(props, "slavename") or ""
+    reason = extract_property(props, "reason") or ""
     started, finished = build_data["times"]
     result = build_data.get("results")
     if isinstance(result, list):
         result = result[0]
 
-    build_id = insert_build(db, builder, number, revision, branch, started, finished, result)
+    build_id = insert_build(db, builder, number, revision, branch, started, finished, result, slave, reason)
+    insert_steps(db, build_id, build_data.get("steps", []))
+    insert_properties(db, build_id, props)
 
-    for step in build_data.get("steps", []):
-        step_name = step["name"]
-        log_names = [l[0] for l in step.get("logs", [])]
+    already_have_outcomes = db.execute(
+        "SELECT 1 FROM outcomes WHERE build_id = ? LIMIT 1", (build_id,)
+    ).fetchone() is not None
 
-        for log_name in log_names:
-            text = fetch_log_text(builder, number, step_name, log_name)
-            if text is None:
-                continue
+    if not already_have_outcomes:
+        for step in build_data.get("steps", []):
+            step_name = step["name"]
+            log_names = [l[0] for l in step.get("logs", [])]
 
-            rel_path = save_log_file(log_root, builder, number, step_name, log_name, text)
-            insert_log(db, build_id, step_name, log_name, rel_path)
-
-            if log_name == "pytestLog":
-                if text.lstrip().startswith("<?xml"):
-                    outcomes = list(parse_xml_log(text))
-                else:
-                    outcomes = list(parse_pytest_log(text))
-                insert_outcomes(db, build_id, outcomes)
-                log.info("%s #%d step %s: %d outcomes", builder, number, step_name, len(outcomes))
+            for log_name in log_names:
+                if log_name == "pytestLog":
+                    text = fetch_log_text(builder, number, step_name, log_name)
+                    if text is None:
+                        continue
+                    if text.lstrip().startswith("<?xml"):
+                        outcomes = list(parse_xml_log(text))
+                    else:
+                        outcomes = list(parse_pytest_log(text))
+                    insert_outcomes(db, build_id, outcomes)
+                    log.info("%s #%d step %s: %d outcomes", builder, number, step_name, len(outcomes))
+                # stdio and other logs: redirect to buildbot HTML viewer (see app.py serve_log)
 
     return True
 

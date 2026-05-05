@@ -1,26 +1,77 @@
 import datetime
+import json
 import os
 import sqlite3
+import subprocess
+import sys
 import urllib.parse
 
-from flask import Flask, abort, g, redirect, render_template, request, send_from_directory
+from importlib.metadata import version as pkg_version
+
+from poller import parse_pytest_log, parse_xml_log
+
+from flask import (
+    Flask,
+    abort,
+    g,
+    redirect,
+    render_template,
+    request,
+    send_from_directory,
+)
 
 DB_PATH = os.environ.get("SUMMARY_DB", "pypy_summary.sqlite")
 LOG_ROOT = os.environ.get("LOG_ROOT", "logs")
 NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "nightly")
 BUILDBOT_URL = "https://buildbot.pypy.org"
 DAYS_DEFAULT = 14
+REVS_DEFAULT = 5
+VERSION = "0.1"
 
 app = Flask(__name__)
 
+
+def _git_hash():
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=here,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
+VERSION_INFO = {
+    "app_version": VERSION,
+    "git_hash": _git_hash(),
+    "flask": pkg_version("flask"),
+    "jinja2": pkg_version("jinja2"),
+    "python": sys.version,
+    "platform": sys.platform,
+}
+
 RESULT_CSS = {0: "success", 1: "warnings", 2: "failure", 4: "exception"}
 RESULT_TEXT = {0: "OK", 1: "warnings", 2: "FAILED", 4: "exception"}
-OUTCOME_CSS = {"F": "failure", "!": "exception", "s": "skip", "x": "skip", "X": "warnings", ".": "success"}
+OUTCOME_CSS = {
+    "F": "failure",
+    "!": "exception",
+    "s": "skip",
+    "x": "skip",
+    "X": "warnings",
+    ".": "success",
+}
 
 
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
+
 
 def get_db():
     if "db" not in g:
@@ -40,10 +91,13 @@ def close_db(exc):
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
+
 def fmt_time(ts):
     if ts is None:
         return "—"
-    return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M"
+    )
 
 
 def fmt_duration(started, finished):
@@ -53,8 +107,26 @@ def fmt_duration(started, finished):
     if secs < 60:
         return f"{secs}s"
     if secs < 3600:
-        return f"{secs//60}m{secs%60:02d}s"
-    return f"{secs//3600}h{(secs%3600)//60}m"
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs // 3600}h{(secs % 3600) // 60}m"
+
+
+CATEGORY_ORDER = [
+    "linux64",
+    "linux32",
+    "aarch64",
+    "macos-arm64",
+    "macos-x86_64",
+    "win64",
+    "benchmark-run",
+]
+
+
+def category_sort_key(cat):
+    try:
+        return CATEGORY_ORDER.index(cat)
+    except ValueError:
+        return len(CATEGORY_ORDER)
 
 
 def revision_sort_key(rev):
@@ -68,13 +140,13 @@ def revision_sort_key(rev):
 
 
 def short_builder(name):
-    """Shorten builder name for column headers, keeping type prefix."""
+    """Within a section all builders share the same platform, so just show type."""
     if name.startswith("pypy-c-jit-"):
-        return "jit-" + name[len("pypy-c-jit-"):]
+        return "jit"
     if name.startswith("own-"):
-        return "own-" + name[len("own-"):]
+        return "own"
     if name.startswith("rpython-"):
-        return "rpy-" + name[len("rpython-"):]
+        return "rpy"
     return name
 
 
@@ -82,85 +154,217 @@ def short_builder(name):
 # Summary matrix logic
 # ---------------------------------------------------------------------------
 
-def build_sections(rows, builds, outcomes_by_build):
+import html as _html
+
+
+def _outcome_counts(outcomes, tests_pass=None):
+    nF = ns = nx = 0
+    for o in outcomes.values():
+        if o in ("F", "!"):
+            nF += 1
+        elif o == "s":
+            ns += 1
+        elif o == "x":
+            nx += 1
+    ndot = tests_pass if tests_pass is not None else 0
+    return ndot, nF, ns, nx
+
+
+def render_section_pre(
+    section_idx,
+    revisions,
+    builds_by_rev_builder,
+    all_builders,
+    full_name,
+    matrix_rows,
+    outcomes_by_build,
+    tests_pass_by_bid=None,
+):
     """
-    rows: list of build dicts (id, builder, number, revision, branch, category, started, finished, result)
+    Render section as <pre> with embedded links/spans, matching buildbot's layout.
+
+    Columns = one per revision.
+    Rows    = one per (builder_short, test_name) that has F/! in any revision.
+    """
+    n = len(revisions)
+    if n == 0:
+        return "<pre>(no builds)</pre>"
+
+    revsize = max(len(r["revision"]) for r in revisions)
+    # align = total chars before builder info on each staircase line
+    align = 2 * n - 1 + revsize
+    lines = []
+
+    # Staircase: one line per revision
+    for i, rev in enumerate(revisions):
+        bars = " |" * i
+        rev_str = rev["revision"]
+        rev_link = f'<a href="{rev["rev_url"]}">{_html.escape(rev_str)}</a>'
+        padding = " " * (align - 2 * i - 1 - len(rev_str))
+        builder_parts = []
+        for bshort in sorted(all_builders):
+            bid = builds_by_rev_builder.get(rev_str, {}).get(bshort)
+            if bid is None:
+                continue
+            outcomes = outcomes_by_build.get(bid, {})
+            tp = (tests_pass_by_bid or {}).get(bid)
+            ndot, nF, ns, nx = _outcome_counts(outcomes, tests_pass=tp)
+            blink = f'<a class="failSummary builder" href="/builders/{_html.escape(full_name[bshort])}">{_html.escape(bshort)}</a>'
+            builder_parts.append(f"{blink} [{ndot}, {nF} F, {ns} s, {nx} x]")
+        builder_info = "  ".join(builder_parts)
+        lines.append(f"{bars} {rev_link}{padding}  {builder_info}  ({rev['date']})\n")
+
+    bars_final = " |" * n
+    lines.append(f"{bars_final}\n")
+
+    # Success row: one +/- per revision, always shown
+    success_parts = []
+    for i, rev in enumerate(revisions):
+        rev_str = rev["revision"]
+        has_error = any(
+            o in ("F", "!")
+            for bshort, bid in builds_by_rev_builder.get(rev_str, {}).items()
+            for o in outcomes_by_build.get(bid, {}).values()
+        )
+        if has_error:
+            link_id = f"a{section_idx}c{1 << i}"
+            success_parts.append(
+                f' <a class="failSummary failed" id="{link_id}"'
+                f' href="javascript:togglestate({section_idx},{1 << i})">-</a>'
+            )
+        else:
+            success_parts.append(' <span class="failSummary success">+</span>')
+    lines.append("".join(success_parts) + "  success\n")
+
+    # Matrix rows
+    for row in matrix_rows:
+        cells = []
+        for i, rev in enumerate(revisions):
+            rev_str = rev["revision"]
+            bid = builds_by_rev_builder.get(rev_str, {}).get(row["builder"])
+            outcome = (
+                outcomes_by_build.get(bid, {}).get(row["test_name"], " ")
+                if bid
+                else " "
+            )
+            if outcome in ("F", "!"):
+                tenc = urllib.parse.quote(row["test_name"], safe="")
+                cells.append(
+                    f' <a class="failSummary failed" href="/longrepr/{bid}/{tenc}">{outcome}</a>'
+                )
+            else:
+                cells.append(f" {outcome}")
+        tname = _html.escape(f"{row['builder']}  {row['test_name']}")
+        span_cls = f"a{section_idx}c{row['combination']}"
+        lines.append(f'<span class="{span_cls}">{"".join(cells)}  {tname}\n</span>')
+
+    return "<nobr><pre>" + "".join(lines) + "</pre></nobr>"
+
+
+def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
+    """
+    builds: sqlite3.Row list (id, builder, number, revision, branch, category, started, finished, result, tests_pass)
     outcomes_by_build: {build_id: {test_name: outcome}}
-    Returns list of section dicts ready for the template.
+    Returns list of section dicts for the template.
     """
-    # Group builds by (category, branch)
+    tests_pass_by_bid = {b["id"]: b["tests_pass"] for b in builds}
     groups = {}
     for b in builds:
         key = (b["category"], b["branch"] or "")
         groups.setdefault(key, []).append(b)
 
     sections = []
-    for (category, branch), group_builds in sorted(groups.items()):
-        # Collect unique revisions, sort by integer prefix
-        revisions = sorted(
+    for section_idx, ((category, branch), group_builds) in enumerate(
+        sorted(groups.items(), key=lambda kv: (category_sort_key(kv[0][0]), kv[0][1]))
+    ):
+        revisions_sorted = sorted(
             {b["revision"] for b in group_builds if b["revision"]},
             key=revision_sort_key,
+        )[-max_revs:]
+
+        # builds_by_rev_builder[rev][builder_short] = build_id
+        builds_by_rev_builder = {}
+        # full_name[builder_short] = full builder name (last seen wins, stable)
+        full_name = {}
+        all_builders = set()
+        all_build_ids = []
+        rev_meta = {}
+
+        for b in group_builds:
+            rev = b["revision"] or ""
+            bshort = short_builder(b["builder"])
+            builds_by_rev_builder.setdefault(rev, {})[bshort] = b["id"]
+            full_name[bshort] = b["builder"]
+            all_builders.add(bshort)
+            all_build_ids.append(b["id"])
+            if rev not in rev_meta:
+                rev_meta[rev] = {
+                    "revision": rev,
+                    "date": fmt_time(b["started"])[:10] if b["started"] else "",
+                    "rev_url": f"{BUILDBOT_URL}/builders/{b['builder']}/builds/{b['number']}",
+                }
+
+        revisions = [rev_meta[r] for r in revisions_sorted if r in rev_meta]
+        n = len(revisions)
+
+        # bid_to_builder[build_id] = builder_short
+        bid_to_builder = {}
+        for rev, bd in builds_by_rev_builder.items():
+            for bshort, bid in bd.items():
+                bid_to_builder[bid] = bshort
+
+        # Rows: (builder_short, test_name) with F/! in any *displayed* revision
+        displayed_bids = {
+            bid
+            for rev in revisions
+            for bid in builds_by_rev_builder.get(rev["revision"], {}).values()
+        }
+        error_keys = set()
+        for bid in displayed_bids:
+            bshort = bid_to_builder.get(bid)
+            if bshort is None:
+                continue
+            for tname, outcome in outcomes_by_build.get(bid, {}).items():
+                if outcome in ("F", "!"):
+                    error_keys.add((bshort, tname))
+
+        matrix_rows = []
+        for bshort, tname in sorted(error_keys):
+            combination = 0
+            for i, rev in enumerate(revisions):
+                bid = builds_by_rev_builder.get(rev["revision"], {}).get(bshort)
+                if bid:
+                    outcome = outcomes_by_build.get(bid, {}).get(tname, " ")
+                    if outcome in ("F", "!"):
+                        combination |= 1 << i
+            matrix_rows.append(
+                {
+                    "builder": bshort,
+                    "test_name": tname,
+                    "combination": combination,
+                }
+            )
+
+        pre_html = render_section_pre(
+            section_idx,
+            revisions,
+            builds_by_rev_builder,
+            all_builders,
+            full_name,
+            matrix_rows,
+            outcomes_by_build,
+            tests_pass_by_bid,
         )
 
-        # For each revision, collect the builders that ran it
-        rev_builds = {}  # revision -> list of build rows
-        for b in group_builds:
-            rev_builds.setdefault(b["revision"] or "", []).append(b)
-
-        # Build column list: one entry per (revision, builder) pair
-        columns = []
-        all_build_ids = []
-        for rev in revisions:
-            rev_rows = sorted(rev_builds.get(rev, []), key=lambda b: b["builder"])
-            first = rev_rows[0]
-            date_str = fmt_time(first["started"])[:10] if first["started"] else ""
-            col = {
-                "revision": rev,
-                "date": date_str,
-                "rev_url": f"{BUILDBOT_URL}/builders/{first['builder']}/builds/{first['number']}",
-                "builders": [{"name": b["builder"], "short": short_builder(b["builder"]), "build_id": b["id"]} for b in rev_rows],
+        sections.append(
+            {
+                "anchor": f"{category}-{branch}".replace("/", "-"),
+                "category": category,
+                "branch": branch,
+                "pre_html": pre_html,
+                "ok": len(matrix_rows) == 0,
             }
-            columns.append(col)
-            all_build_ids.extend(b["id"] for b in rev_rows)
-
-        # Collect all failing/non-pass test names across these builds
-        failing_tests = set()
-        for bid in all_build_ids:
-            for tname, outcome in outcomes_by_build.get(bid, {}).items():
-                if outcome != ".":
-                    failing_tests.add(tname)
-
-        # Build rows
-        matrix_rows = []
-        for tname in sorted(failing_tests):
-            cells = []
-            for col in columns:
-                for b in col["builders"]:
-                    outcome = outcomes_by_build.get(b["build_id"], {}).get(tname, " ")
-                    cells.append({
-                        "outcome": outcome,
-                        "css": OUTCOME_CSS.get(outcome, ""),
-                        "build_id": b["build_id"],
-                        "test_name_enc": urllib.parse.quote(tname, safe=""),
-                    })
-            # Split test name into module + test for display
-            if "::" in tname:
-                module, testname = tname.split("::", 1)
-            elif ":" in tname:
-                module, testname = tname.split(":", 1)
-            else:
-                module, testname = tname, ""
-            matrix_rows.append({"module": module, "testname": testname, "cells": cells})
-
-        ncols = sum(len(col["builders"]) for col in columns)
-        sections.append({
-            "anchor": f"{category}-{branch}".replace("/", "-"),
-            "title": f"{{{category}}} {branch}",
-            "columns": columns,
-            "rows": matrix_rows,
-            "ncols": ncols,
-            "ok": len(matrix_rows) == 0,
-        })
+        )
 
     return sections
 
@@ -169,10 +373,24 @@ def build_sections(rows, builds, outcomes_by_build):
 # Routes
 # ---------------------------------------------------------------------------
 
+
+@app.context_processor
+def inject_globals():
+    return {"version_info": VERSION_INFO, "now": _now()}
+
+
+def _now():
+    return fmt_time(datetime.datetime.now(datetime.timezone.utc).timestamp())
+
+
 @app.route("/")
 def index():
-    return render_template("index.html", page_title="PyPy Buildbot",
-                           now=fmt_time(datetime.datetime.utcnow().timestamp()))
+    return render_template("index.html", page_title="PyPy Buildbot", now=_now())
+
+
+@app.route("/about")
+def about():
+    return render_template("about.html", page_title="About", now=_now(), **VERSION_INFO)
 
 
 @app.route("/summary")
@@ -181,11 +399,12 @@ def summary():
     category = request.args.get("category")
     branch = request.args.get("branch")
     days = int(request.args.get("days", DAYS_DEFAULT))
-    cutoff = datetime.datetime.utcnow().timestamp() - days * 86400
+    max_revs = int(request.args.get("maxrev", REVS_DEFAULT))
+    cutoff = datetime.datetime.now(datetime.timezone.utc).timestamp() - days * 86400
 
     query = """
         SELECT b.id, b.builder, b.number, b.revision, b.branch,
-               b.started, b.finished, b.result, bl.category
+               b.started, b.finished, b.result, b.tests_pass, bl.category
         FROM builds b
         JOIN builders bl ON b.builder = bl.name
         WHERE b.finished > ? AND b.finished IS NOT NULL
@@ -206,13 +425,17 @@ def summary():
     if build_ids:
         placeholders = ",".join("?" * len(build_ids))
         rows = db.execute(
-            f"SELECT build_id, test_name, outcome FROM outcomes WHERE build_id IN ({placeholders})",
+            f"""SELECT o.build_id, t.name AS test_name, o.outcome
+                FROM outcomes o JOIN test_names t ON o.test_name_id = t.id
+                WHERE o.build_id IN ({placeholders})""",
             build_ids,
         ).fetchall()
         for row in rows:
-            outcomes_by_build.setdefault(row["build_id"], {})[row["test_name"]] = row["outcome"]
+            outcomes_by_build.setdefault(row["build_id"], {})[row["test_name"]] = row[
+                "outcome"
+            ]
 
-    sections = build_sections(None, builds, outcomes_by_build)
+    sections = build_sections(builds, outcomes_by_build, max_revs=max_revs)
 
     return render_template(
         "summary.html",
@@ -225,29 +448,37 @@ def summary():
 @app.route("/builders")
 def builders():
     db = get_db()
-    rows = db.execute("""
-        SELECT bl.name, bl.category,
-               b.number AS last_number, b.result
-        FROM builders bl
-        LEFT JOIN builds b ON b.id = (
-            SELECT id FROM builds WHERE builder = bl.name
-            ORDER BY number DESC LIMIT 1
-        )
-        ORDER BY bl.name
-    """).fetchall()
+    rows = db.execute("SELECT name, category FROM builders ORDER BY name").fetchall()
+
+    def last_build_for_branch(builder_name, branch):
+        r = db.execute(
+            """SELECT number, result FROM builds
+               WHERE builder = ? AND branch = ?
+               ORDER BY number DESC LIMIT 1""",
+            (builder_name, branch),
+        ).fetchone()
+        if r is None:
+            return "—", "", ""
+        return r["number"], RESULT_TEXT.get(r["result"], "—"), RESULT_CSS.get(r["result"], "")
 
     builders_data = []
     for r in rows:
-        builders_data.append({
-            "name": r["name"],
-            "category": r["category"],
-            "last_number": r["last_number"] or "—",
-            "result_text": RESULT_TEXT.get(r["result"], "—"),
-            "css": RESULT_CSS.get(r["result"], ""),
-        })
+        main_num, main_text, main_css = last_build_for_branch(r["name"], "main")
+        py311_num, py311_text, py311_css = last_build_for_branch(r["name"], "py3.11")
+        builders_data.append(
+            {
+                "name": r["name"],
+                "category": r["category"],
+                "main_number": main_num,
+                "main_text": main_text,
+                "main_css": main_css,
+                "py311_number": py311_num,
+                "py311_text": py311_text,
+                "py311_css": py311_css,
+            }
+        )
 
-    return render_template("builders.html", builders=builders_data,
-                           page_title="Builders", now=fmt_time(datetime.datetime.utcnow().timestamp()))
+    return render_template("builders.html", builders=builders_data, page_title="Builders")
 
 
 @app.route("/builders/<name>")
@@ -261,61 +492,83 @@ def builder(name):
 
     builds_data = []
     for b in builds:
-        builds_data.append({
-            "number": b["number"],
-            "revision": b["revision"] or "",
-            "branch": b["branch"] or "",
-            "started_fmt": fmt_time(b["started"]),
-            "duration": fmt_duration(b["started"], b["finished"]),
-            "result_text": RESULT_TEXT.get(b["result"], "running"),
-            "css": RESULT_CSS.get(b["result"], ""),
-        })
+        builds_data.append(
+            {
+                "number": b["number"],
+                "revision": b["revision"] or "",
+                "branch": b["branch"] or "",
+                "started_fmt": fmt_time(b["started"]),
+                "duration": fmt_duration(b["started"], b["finished"]),
+                "result_text": RESULT_TEXT.get(b["result"], "running"),
+                "css": RESULT_CSS.get(b["result"], ""),
+            }
+        )
 
-    return render_template("builder.html", builder=name, builds=builds_data,
-                           page_title=name, now=fmt_time(datetime.datetime.utcnow().timestamp()))
+    return render_template(
+        "builder.html",
+        builder=name,
+        builds=builds_data,
+        page_title=name,
+        now=fmt_time(datetime.datetime.utcnow().timestamp()),
+    )
 
 
 @app.route("/builders/<name>/builds/<int:number>")
 def build(name, number):
     db = get_db()
     b = db.execute(
-        "SELECT id, revision, branch, started, finished, result FROM builds"
+        "SELECT id, revision, branch, started, finished, result, slave, reason FROM builds"
         " WHERE builder = ? AND number = ?",
         (name, number),
     ).fetchone()
     if not b:
         abort(404)
 
-    logs = db.execute(
+    # Local log paths keyed by (step_name, log_name)
+    local_logs = {}
+    for row in db.execute(
         "SELECT step_name, log_name, path FROM logs WHERE build_id = ? ORDER BY rowid",
         (b["id"],),
-    ).fetchall()
+    ):
+        local_logs[(row["step_name"], row["log_name"])] = row["path"]
 
-    # Group logs by step
-    steps_map = {}
-    for l in logs:
-        steps_map.setdefault(l["step_name"], []).append((l["log_name"], l["path"]))
+    # Steps from DB
+    steps_data = []
+    for step in db.execute(
+        "SELECT name, text, log_names, result, started, finished FROM steps WHERE build_id = ? ORDER BY step_number",
+        (b["id"],),
+    ):
+        sname = step["name"]
+        result_code = step["result"]
+        finished = step["finished"]
+        result_text = RESULT_TEXT.get(result_code, "—" if finished else "running")
+        css = RESULT_CSS.get(result_code, "")
+        duration = fmt_duration(step["started"], finished)
+        local_log_names = {ln for sn, ln in local_logs if sn == sname}
+        logs = []
+        for (step_name, log_name), path in local_logs.items():
+            if step_name != sname:
+                continue
+            logs.append({"name": log_name, "url": f"/logs/{path}"})
+        # Link non-mirrored logs to buildbot HTML viewer using stored log_names
+        step_log_names = json.loads(step["log_names"]) if step["log_names"] else []
+        for log_name in step_log_names:
+            if log_name not in local_log_names and log_name != "pytestLog":
+                bb_url = f"{BUILDBOT_URL}/builders/{name}/builds/{number}/steps/{sname}/logs/{log_name}"
+                logs.append({"name": log_name, "url": bb_url})
+        steps_data.append({
+            "name": sname,
+            "text": step["text"] or "",
+            "result_text": result_text,
+            "css": css,
+            "duration": duration,
+            "logs": logs,
+        })
 
-    # Pull non-pass outcomes
-    outcomes = db.execute(
-        "SELECT test_name, outcome FROM outcomes WHERE build_id = ? ORDER BY test_name",
+    props_data = db.execute(
+        "SELECT name, value, source FROM properties WHERE build_id = ? ORDER BY name",
         (b["id"],),
     ).fetchall()
-
-    outcomes_data = [
-        {
-            "test_name": o["test_name"],
-            "outcome": o["outcome"],
-            "css": OUTCOME_CSS.get(o["outcome"], ""),
-            "test_name_enc": urllib.parse.quote(o["test_name"], safe=""),
-        }
-        for o in outcomes
-    ]
-
-    steps_data = [
-        {"name": step, "result_text": "", "css": "", "logs": log_list}
-        for step, log_list in steps_map.items()
-    ]
 
     return render_template(
         "build.html",
@@ -323,24 +576,58 @@ def build(name, number):
         revision=b["revision"] or "", branch=b["branch"] or "",
         started_fmt=fmt_time(b["started"]),
         duration=fmt_duration(b["started"], b["finished"]),
-        steps=steps_data,
-        outcomes=outcomes_data,
-        build_id=b["id"],
+        result_text=RESULT_TEXT.get(b["result"], "—"),
+        result_css=RESULT_CSS.get(b["result"], ""),
+        slave=b["slave"] or "", reason=b["reason"] or "",
+        steps=steps_data, props=props_data,
         page_title=f"{name} #{number}",
-        now=fmt_time(datetime.datetime.utcnow().timestamp()),
     )
 
 
 @app.route("/longrepr/<int:build_id>/<path:test_name>")
 def longrepr(build_id, test_name):
+    import html as _h
+
     db = get_db()
-    row = db.execute(
-        "SELECT longrepr FROM outcomes WHERE build_id = ? AND test_name = ?",
-        (build_id, test_name),
+    build = db.execute(
+        "SELECT builder, number FROM builds WHERE id = ?", (build_id,)
     ).fetchone()
-    if not row or not row["longrepr"]:
+    if not build:
         abort(404)
-    return f"<pre>{row['longrepr']}</pre>", 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    log_row = db.execute(
+        "SELECT path FROM logs WHERE build_id = ? AND log_name = 'pytestLog' LIMIT 1",
+        (build_id,),
+    ).fetchone()
+    if not log_row:
+        abort(404)
+
+    log_path = os.path.join(LOG_ROOT, log_row["path"])
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        abort(404)
+
+    longrepr_text = None
+    parser = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
+    for name, outcome, repr_text in parser(text):
+        if name == test_name and repr_text:
+            longrepr_text = repr_text
+            break
+
+    if not longrepr_text:
+        abort(404)
+
+    builder = _h.escape(build["builder"])
+    number = build["number"]
+    rerun = test_name.replace(".", "/").replace("::", "/")
+    title = _h.escape(test_name)
+    body = f"""<h2><b>{title}</b></h2>
+<pre>{_h.escape(longrepr_text)}</pre>
+<pre style="border-top:1px solid"><a href="/builders/{builder}/builds/{number}">builder: {builder} build #{number}</a></pre>
+<pre>test: {_h.escape(rerun)}</pre>"""
+    return render_template("longrepr.html", page_title=test_name, body=body)
 
 
 @app.route("/logs/<path:rel_path>")
@@ -348,14 +635,16 @@ def serve_log(rel_path):
     # rel_path is builder/number/step/logname.txt
     full_path = os.path.join(LOG_ROOT, rel_path)
     if os.path.exists(full_path):
-        return send_from_directory(LOG_ROOT, rel_path, mimetype="text/plain")
-    # Reconstruct buildbot URL: builder/number/step/logname.txt
-    # → /builders/builder/builds/number/steps/step/logs/logname/text
+        mimetype = "text/html" if rel_path.endswith(".html") else "text/plain"
+        return send_from_directory(LOG_ROOT, rel_path, mimetype=mimetype)
+    # Reconstruct buildbot URL: builder/number/step/logname.{html,txt}
+    # → /builders/builder/builds/number/steps/step/logs/logname[/text]
     parts = rel_path.rstrip("/").split("/")
     if len(parts) == 4:
         builder, number, step, logfile = parts
-        log_name = logfile.removesuffix(".txt")
-        fallback = f"{BUILDBOT_URL}/builders/{builder}/builds/{number}/steps/{step}/logs/{log_name}/text"
+        log_name = logfile.removesuffix(".txt").removesuffix(".html")
+        suffix = "/text" if rel_path.endswith(".txt") else ""
+        fallback = f"{BUILDBOT_URL}/builders/{builder}/builds/{number}/steps/{step}/logs/{log_name}{suffix}"
         return redirect(fallback, code=302)
     abort(404)
 
@@ -369,10 +658,14 @@ def serve_nightly(rel_path=""):
     if os.path.isdir(full_path):
         # Serve a directory listing of locally mirrored files with fallback links
         entries = sorted(os.listdir(full_path)) if os.path.exists(full_path) else []
-        lines = [f'<a href="{e}{"/" if os.path.isdir(os.path.join(full_path, e)) else ""}">{e}</a><br/>'
-                 for e in entries]
+        lines = [
+            f'<a href="{e}{"/" if os.path.isdir(os.path.join(full_path, e)) else ""}">{e}</a><br/>'
+            for e in entries
+        ]
         fallback_url = f"{BUILDBOT_URL}/nightly/{rel_path}"
-        lines.append(f'<br/><a href="{fallback_url}">Browse all on buildbot.pypy.org</a>')
+        lines.append(
+            f'<br/><a href="{fallback_url}">Browse all on buildbot.pypy.org</a>'
+        )
         return "\n".join(lines), 200, {"Content-Type": "text/html; charset=utf-8"}
     # Not mirrored yet — redirect to buildbot
     return redirect(f"{BUILDBOT_URL}/nightly/{rel_path}", code=302)

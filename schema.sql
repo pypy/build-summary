@@ -1,9 +1,9 @@
-CREATE TABLE builders (
+CREATE TABLE IF NOT EXISTS builders (
     name     TEXT PRIMARY KEY,
     category TEXT NOT NULL
 );
 
-CREATE TABLE builds (
+CREATE TABLE IF NOT EXISTS builds (
     id       INTEGER PRIMARY KEY,
     builder  TEXT    NOT NULL REFERENCES builders(name),
     number   INTEGER NOT NULL,
@@ -12,28 +12,58 @@ CREATE TABLE builds (
     started  REAL,           -- unix timestamp
     finished REAL,           -- unix timestamp; NULL if still running
     result   INTEGER,        -- 0=success 2=failure 4=exception NULL=in progress
+    slave      TEXT,
+    reason     TEXT,
+    tests_pass INTEGER,  -- count of passing tests; NULL means unknown
     UNIQUE(builder, number)
 );
 
-CREATE INDEX builds_builder_branch_finished
+CREATE INDEX IF NOT EXISTS builds_builder_branch_finished
     ON builds(builder, branch, finished);
 
-CREATE INDEX builds_revision
+CREATE INDEX IF NOT EXISTS builds_revision
     ON builds(revision);
 
-CREATE TABLE outcomes (
-    build_id  INTEGER NOT NULL REFERENCES builds(id),
-    test_name TEXT    NOT NULL,  -- full path e.g. pypy.module.test.test_foo::test_bar
-    outcome   TEXT    NOT NULL,  -- F . s x X !
-    longrepr  TEXT,              -- traceback text; NULL unless outcome is F or !
-    PRIMARY KEY(build_id, test_name)
+CREATE TABLE IF NOT EXISTS steps (
+    id          INTEGER PRIMARY KEY,
+    build_id    INTEGER NOT NULL REFERENCES builds(id),
+    step_number INTEGER NOT NULL,
+    name        TEXT    NOT NULL,
+    text        TEXT,       -- human-readable description from buildbot step "text" field
+    log_names   TEXT,       -- JSON array of log names available for this step
+    result      INTEGER,    -- 0=success 2=failure 4=exception NULL=running/skipped
+    started     REAL,
+    finished    REAL,
+    UNIQUE(build_id, step_number)
 );
 
-CREATE INDEX outcomes_build_id ON outcomes(build_id);
+CREATE INDEX IF NOT EXISTS steps_build_id ON steps(build_id);
+
+CREATE TABLE IF NOT EXISTS properties (
+    build_id INTEGER NOT NULL REFERENCES builds(id),
+    name     TEXT    NOT NULL,
+    value    TEXT,
+    source   TEXT,
+    PRIMARY KEY(build_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS test_names (
+    id   INTEGER PRIMARY KEY,
+    name TEXT    NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS outcomes (
+    build_id     INTEGER NOT NULL REFERENCES builds(id),
+    test_name_id INTEGER NOT NULL REFERENCES test_names(id),
+    outcome      TEXT    NOT NULL,  -- F . s x X !
+    PRIMARY KEY(build_id, test_name_id)
+);
+
+CREATE INDEX IF NOT EXISTS outcomes_build_id ON outcomes(build_id);
 
 -- Tracks which log files have been fetched and where they live on disk.
 -- nginx serves these directly; Flask never touches them.
-CREATE TABLE logs (
+CREATE TABLE IF NOT EXISTS logs (
     build_id  INTEGER NOT NULL REFERENCES builds(id),
     step_name TEXT    NOT NULL,
     log_name  TEXT    NOT NULL,  -- 'stdio' or 'pytestLog'
@@ -43,7 +73,7 @@ CREATE TABLE logs (
 
 -- Poller checkpoint: highest build number fully ingested per builder.
 -- Lets the cron job resume without re-fetching old builds.
-CREATE TABLE sync_state (
+CREATE TABLE IF NOT EXISTS sync_state (
     builder    TEXT    PRIMARY KEY,
     last_build INTEGER NOT NULL DEFAULT 0
 );

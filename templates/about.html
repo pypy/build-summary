@@ -1,0 +1,21 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>About this Buildbot Mirror</h2>
+
+<h3>Version Information</h3>
+<ul>
+  <li>PyPy Summary: {{ app_version }} ({{ git_hash }})</li>
+  <li>Flask: {{ flask }}</li>
+  <li>Jinja2: {{ jinja2 }}</li>
+  <li>Python: {{ python }}</li>
+  <li>Platform: {{ platform }}</li>
+</ul>
+
+<h3>Source code</h3>
+<p>
+  This is a mirror and summary service for the
+  <a href="https://buildbot.pypy.org/">PyPy Buildbot</a>.
+  Source code is available at
+  <a href="https://github.com/pypy/pypy">github.com/pypy/pypy</a>.
+</p>
+{% endblock %}
