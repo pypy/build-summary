@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>{{ page_title }}</title>
+  <link rel="stylesheet" href="/static/summary.css" type="text/css"/>
+  {% block head %}{% endblock %}
+</head>
+<body class="interface">
+  <div class="header">
+    <a href="/">Home</a>
+    - Summaries:
+    <a href="/summary?branch=main">(main)</a>
+    : <a href="/summary?branch=py3.10">(py3.10)</a>
+    : <a href="/summary?branch=py3.11">(py3.11)</a>
+    : <a href="/summary">Everything</a>
+    - <a href="/builders">Builders</a>
+  </div>
+  <hr/>
+  <div class="content">
+    {% block content %}{% endblock %}
+  </div>
+  <div class="footer" style="clear:both">
+    <hr/>
+    Page built: <b>{{ now }}</b>
+  </div>
+</body>
+</html>

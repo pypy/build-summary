@@ -1,0 +1,41 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2><a href="/builders/{{ builder }}">{{ builder }}</a> #{{ number }}</h2>
+<p>Revision: {{ revision }} &nbsp; Branch: {{ branch }}</p>
+<p>Started: {{ started_fmt }} &nbsp; Duration: {{ duration }}</p>
+<table class="results">
+<tr><th>Step</th><th>Result</th><th>Logs</th></tr>
+{% for step in steps %}
+<tr>
+  <td>{{ step.name }}</td>
+  <td class="result {{ step.css }}">{{ step.result_text }}</td>
+  <td>
+    {% for logname, path in step.logs %}
+    <a href="/logs/{{ path }}">{{ logname }}</a>&nbsp;
+    {% endfor %}
+  </td>
+</tr>
+{% endfor %}
+</table>
+
+{% if outcomes %}
+<h3>Test outcomes</h3>
+<table class="results">
+<tr><th>Test</th><th>Outcome</th></tr>
+{% for o in outcomes %}
+{% if o.outcome != '.' %}
+<tr>
+  <td>{{ o.test_name }}</td>
+  <td class="result {{ o.css }}">
+    {% if o.outcome in ('F', '!') %}
+    <a href="/longrepr/{{ build_id }}/{{ o.test_name_enc }}">{{ o.outcome }}</a>
+    {% else %}
+    {{ o.outcome }}
+    {% endif %}
+  </td>
+</tr>
+{% endif %}
+{% endfor %}
+</table>
+{% endif %}
+{% endblock %}

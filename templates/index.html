@@ -1,0 +1,12 @@
+{% extends "layout.html" %}
+{% block content %}
+<h1>Welcome to the Buildbot for the <a href="https://pypy.org/">PyPy</a> project!</h1>
+<ul>
+  <li>The <a href="https://speed.pypy.org/">Performance Plots</a> will give you an overview of performance for recent revisions.</li>
+  <li>The <a href="/summary?branch=main">Summary Display (main)</a> will give you a failure-oriented summary for recent revisions on the main branch.</li>
+  <li>The <a href="/summary">Summary Display</a> will give you a failure-oriented summary for recent revisions (all branches).</li>
+  <li>The <a href="/nightly/">Nightly Build page</a> contains precompiled PyPy binaries.</li>
+  <li>The <a href="/benchmarks/">Benchmark results page</a> contains JSON files from benchmark runs, used for <a href="https://speed.pypy.org/">speed.pypy.org</a>.</li>
+  <li>The <a href="/builders">Builders</a> and their most recent builds are listed here.</li>
+</ul>
+{% endblock %}

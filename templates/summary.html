@@ -1,0 +1,80 @@
+{% extends "layout.html" %}
+
+{% block head %}
+<link rel="stylesheet" href="/static/summary.css" type="text/css"/>
+<script type="text/javascript">
+  var hiddenstates = [];
+  function togglestate(a, c) {
+    var start = "a" + a + "c";
+    var link = document.getElementById(start + c);
+    var state = hiddenstates[a] || 0;
+    if (state & c) { state -= c; link.textContent = '-'; }
+    else            { state |= c; link.textContent = 'H'; }
+    hiddenstates[a] = state;
+    var spans = document.getElementsByTagName('span');
+    for (var i = 0; i < spans.length; i++) {
+      var span = spans[i];
+      if (span.className.substr(0, start.length) === start) {
+        var k = span.className.substr(start.length);
+        span.style.display = ((state & k) === +k) ? 'none' : 'block';
+      }
+    }
+  }
+</script>
+{% endblock %}
+
+{% block content %}
+{% for section in sections %}
+<h2><a name="{{ section.anchor }}">{{ section.title }}</a>
+  {% if section.ok %} &#x2705;{% endif %}
+</h2>
+
+{% if not section.columns %}
+  <p>No builds.</p>
+{% else %}
+
+{# Column header: revision links #}
+<table class="results">
+<tr>
+  <th></th>
+  {% for col in section.columns %}
+  <th class="rev" colspan="{{ col.builders|length }}">
+    <a href="{{ col.rev_url }}">{{ col.revision }}</a>
+    <br/><small>{{ col.date }}</small>
+  </th>
+  {% endfor %}
+</tr>
+<tr>
+  <th>test</th>
+  {% for col in section.columns %}
+    {% for b in col.builders %}
+    <th class="builder"><a href="/builders/{{ b.name }}">{{ b.short }}</a></th>
+    {% endfor %}
+  {% endfor %}
+</tr>
+
+{% if section.ok %}
+<tr><td colspan="{{ section.ncols + 1 }}">&#x2705; success</td></tr>
+{% else %}
+{% for row in section.rows %}
+<tr>
+  <td class="test">
+    {{ row.module }}<br/><small>{{ row.testname }}</small>
+  </td>
+  {% for cell in row.cells %}
+  <td class="result {{ cell.css }}">
+    {% if cell.outcome in ('F', '!') %}
+    <a href="/longrepr/{{ cell.build_id }}/{{ cell.test_name_enc }}">{{ cell.outcome }}</a>
+    {% else %}
+    {{ cell.outcome }}
+    {% endif %}
+  </td>
+  {% endfor %}
+</tr>
+{% endfor %}
+{% endif %}
+
+</table>
+{% endif %}
+{% endfor %}
+{% endblock %}

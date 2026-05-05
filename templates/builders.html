@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Builders</h2>
+<table class="results">
+<tr><th>Builder</th><th>Category</th><th>Last build</th><th>Status</th></tr>
+{% for b in builders %}
+<tr>
+  <td><a href="/builders/{{ b.name }}">{{ b.name }}</a></td>
+  <td>{{ b.category }}</td>
+  <td>{{ b.last_number }}</td>
+  <td class="result {{ b.css }}">{{ b.result_text }}</td>
+</tr>
+{% endfor %}
+</table>
+{% endblock %}
