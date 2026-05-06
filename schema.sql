@@ -77,3 +77,15 @@ CREATE TABLE IF NOT EXISTS sync_state (
     builder    TEXT    PRIMARY KEY,
     last_build INTEGER NOT NULL DEFAULT 0
 );
+
+-- History of sync script runs for the status page.
+CREATE TABLE IF NOT EXISTS sync_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    script       TEXT    NOT NULL,   -- 'buildbot', 'nightly', 'benchmark'
+    started      REAL    NOT NULL,
+    finished     REAL,
+    status       TEXT    NOT NULL DEFAULT 'running',  -- 'running', 'ok', 'error'
+    items_synced INTEGER NOT NULL DEFAULT 0,
+    bytes_fetched INTEGER NOT NULL DEFAULT 0,
+    output       TEXT    -- captured log output, truncated at 64KB
+);

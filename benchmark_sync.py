@@ -36,7 +36,7 @@ def _buildbot_filename(revision):
     return revision + '-64.json'
 
 
-def sync(bench_root, db_path):
+def sync(bench_root, db_path, run=None):
     os.makedirs(bench_root, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -51,7 +51,6 @@ def sync(bench_root, db_path):
     revisions = [r['revision'] for r in rows if _REV_RE.match(r['revision'])]
     log.info("found %d revisions for %s", len(revisions), BUILDER_NAME)
 
-    downloaded = 0
     for rev in revisions:
         local_name = _local_filename(rev)
         dest = os.path.join(bench_root, local_name)
@@ -60,24 +59,29 @@ def sync(bench_root, db_path):
             continue
         bb_name = _buildbot_filename(rev)
         url = f"{BUILDBOT_URL}/benchmark-results/{bb_name}"
-        log.info("downloading %s", bb_name)
+        log.debug("checking %s", bb_name)
         try:
             with requests.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
                 if r.status_code == 404:
                     log.debug("not found on buildbot: %s", bb_name)
                     continue
                 r.raise_for_status()
+                data = b''
                 with open(dest + '.tmp', 'wb') as f:
                     for chunk in r.iter_content(chunk_size=1 << 16):
                         f.write(chunk)
+                        data += chunk
             os.replace(dest + '.tmp', dest)
-            downloaded += 1
+            log.info("downloaded %s", bb_name)
+            if run:
+                run.items_synced += 1
+                run.bytes_fetched += len(data)
         except Exception:
             log.exception("failed downloading %s", bb_name)
             if os.path.exists(dest + '.tmp'):
                 os.unlink(dest + '.tmp')
 
-    log.info("downloaded %d new files", downloaded)
+    log.info("downloaded %d new files", run.items_synced if run else '?')
 
 
 def main():
@@ -91,7 +95,9 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    sync(args.bench_root, args.db)
+    from sync_util import SyncRun
+    with SyncRun("benchmark", args.db) as run:
+        sync(args.bench_root, args.db, run)
 
 
 if __name__ == "__main__":

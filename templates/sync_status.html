@@ -1,0 +1,31 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Sync Status</h2>
+
+{% if runs %}
+<table class="info">
+<tr>
+  <th>Script</th>
+  <th>Started</th>
+  <th>Duration</th>
+  <th>Status</th>
+  <th>Items</th>
+  <th>Data</th>
+  <th>Log</th>
+</tr>
+{% for r in runs %}
+<tr class="{% if r.status == 'ok' %}success{% elif r.status in ('error', 'interrupted') %}failure{% else %}running{% endif %}">
+  <td>{{ r.script }}</td>
+  <td>{{ r.started }}</td>
+  <td>{{ r.duration }}</td>
+  <td>{{ r.status }}</td>
+  <td>{{ r.items_synced }}</td>
+  <td>{{ r.bytes_fetched }}</td>
+  <td><a href="/sync-log/{{ r.id }}">view</a></td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>No sync runs recorded yet.</p>
+{% endif %}
+{% endblock %}

@@ -380,12 +380,18 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    from sync_util import SyncRun
     os.makedirs(args.log_root, exist_ok=True)
-    db = open_db(args.db)
 
-    start = time.time()
-    poll_all(db, args.log_root)
-    log.info("done in %.1fs", time.time() - start)
+    with SyncRun("buildbot", args.db) as run:
+        db = open_db(args.db)
+        start = time.time()
+        before = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
+        poll_all(db, args.log_root)
+        after = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
+        run.items_synced = after - before
+        log.info("done in %.1fs (%d new finished builds)", time.time() - start, run.items_synced)
+        db.close()
 
 
 if __name__ == "__main__":

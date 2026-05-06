@@ -1,6 +1,8 @@
 import datetime
+import itertools
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -8,7 +10,7 @@ import urllib.parse
 
 from importlib.metadata import version as pkg_version
 
-from poller import parse_pytest_log, parse_xml_log
+from buildbot_sync import parse_pytest_log, parse_xml_log
 
 from flask import (
     Flask,
@@ -23,10 +25,11 @@ from flask import (
 DB_PATH = os.environ.get("SUMMARY_DB", "pypy_summary.sqlite")
 LOG_ROOT = os.environ.get("LOG_ROOT", "logs")
 NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "nightly")
+BENCH_ROOT = os.environ.get("BENCH_ROOT", "benchmark-results")
 BUILDBOT_URL = "https://buildbot.pypy.org"
 DAYS_DEFAULT = 14
 REVS_DEFAULT = 5
-VERSION = "0.1"
+VERSION = "0.2"
 
 app = Flask(__name__)
 
@@ -376,7 +379,7 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
 
 @app.context_processor
 def inject_globals():
-    return {"version_info": VERSION_INFO, "now": _now()}
+    return {"version_info": VERSION_INFO, "now": _now(), "buildbot_url": BUILDBOT_URL}
 
 
 def _now():
@@ -655,26 +658,317 @@ def serve_log(rel_path):
     abort(404)
 
 
+_PYPY_PLATFORMS = {
+    'linux':        'linux-x86-32',
+    'linux64':      'linux-x86-64',
+    'aarch64':      'linux-aarch64',
+    'macos_x86_64': 'macos-x86-64',
+    'macos_arm64':  'macos-arm64',
+    'win32':        'win-x86-32',
+    'win64':        'win-x86-64',
+    's390x':        'linux-s390x',
+}
+
+_PYPY_DESCRIPTIONS = {
+    'nojit':     'app-level',
+    'jit':       'jit',
+    'stackless': 'stackless-app-level',
+}
+
+
+def _parse_pypy_tarball(filename):
+    """Parse a PyPy nightly tarball filename; return info dict or None."""
+    for ext in ('.tar.bz2', '.zip'):
+        if filename.endswith(ext):
+            break
+    else:
+        return None
+    name = filename[:-len(ext)]
+    name = name.replace('-armel', '_armel').replace('-libc2', '_libc2').replace('-armhf-ra', '_armhf_ra')
+    parts = name.split('-')
+    if len(parts) == 6:  # hg: exe-backend-features-num-hash-platform
+        exe, backend, features, num, rev_hash, platform = parts
+        try:
+            revnum = int(num)
+        except ValueError:
+            return None
+        revision = f"{num}:{rev_hash}"
+        is_latest = False
+    elif len(parts) == 5:  # svn or latest: exe-backend-features-rev-platform
+        exe, backend, features, rev, platform = parts
+        if rev == 'latest':
+            revnum = -1
+            rev_hash = None
+            revision = 'latest'
+            is_latest = True
+        else:
+            try:
+                revnum = int(rev)
+            except ValueError:
+                return None
+            rev_hash = None
+            revision = rev
+            is_latest = False
+    else:
+        return None
+    platform_str = _PYPY_PLATFORMS.get(platform, platform)
+    desc = _PYPY_DESCRIPTIONS.get(features, features)
+    return {
+        'exe': exe, 'backend': backend, 'features': features,
+        'revnum': revnum, 'rev_hash': rev_hash, 'revision': revision,
+        'platform': platform, 'platform_str': platform_str,
+        'own_builder': f'own-{platform_str}',
+        'app_builder': f'{exe}-{backend}-{desc}-{platform_str}',
+        'is_latest': is_latest,
+    }
+
+
+def _format_size(n):
+    if n < 1024:
+        return f"{n} B"
+    elif n < 1024 ** 2:
+        return f"{n // 1024} kB"
+    elif n < 1024 ** 3:
+        return f"{n / 1024**2:.1f} MB"
+    return f"{n / 1024**3:.1f} GB"
+
+
+def _build_summary_for_file(db, builder_name, revision, branch, row_class):
+    """Return (summary_text, css_class) for a tarball's build."""
+    if revision == 'latest':
+        return '', row_class
+    # revision stored as "NNNNNN:HASH" or just number
+    row = db.execute(
+        """SELECT id, number, result, tests_pass FROM builds
+           WHERE builder = ? AND revision = ? AND branch = ?
+           ORDER BY number DESC LIMIT 1""",
+        (builder_name, revision, branch),
+    ).fetchone()
+    if row is None:
+        return '', row_class
+    result = row['result']
+    tests_pass = row['tests_pass']
+    build_url = f"/builders/{builder_name}/builds/{row['number']}"
+    if result == 0:
+        css = row_class + '-passed'
+        label = f"{tests_pass} passed" if tests_pass else "ok"
+    else:
+        css = row_class + '-failed'
+        label = "failed"
+    return f'<a class="summary_link" href="{build_url}">{label}</a>', css
+
+
+def _nightly_index():
+    """Return branch dicts sorted trunk/main first then by name."""
+    if not os.path.isdir(NIGHTLY_ROOT):
+        return []
+    branches = []
+    for name in os.listdir(NIGHTLY_ROOT):
+        if name == 'trunk':
+            continue
+        d = os.path.join(NIGHTLY_ROOT, name)
+        if not os.path.isdir(d):
+            continue
+        try:
+            mtime = os.path.getmtime(d)
+            date = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d')
+            size = sum(
+                os.path.getsize(os.path.join(d, f))
+                for f in os.listdir(d)
+                if os.path.isfile(os.path.join(d, f))
+            )
+        except OSError:
+            date = ''
+            size = 0
+        branches.append({'name': name, 'date': date, 'size': _format_size(size)})
+
+    def _branch_key(b):
+        return (0 if b['name'] in ('trunk', 'main') else 1, b['name'])
+
+    branches.sort(key=_branch_key)
+    return branches
+
+
+def _nightly_branch_data(branch):
+    """Return list of file dicts (newest first) for the branch listing."""
+    branch_dir = os.path.join(NIGHTLY_ROOT, branch)
+    if not os.path.isdir(branch_dir):
+        return []
+    db = get_db()
+    raw = []
+    for fname in os.listdir(branch_dir):
+        fpath = os.path.join(branch_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        info = _parse_pypy_tarball(fname)
+        if info is None:
+            continue
+        try:
+            st = os.stat(fpath)
+            size = _format_size(st.st_size)
+            date = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d')
+        except OSError:
+            size = ''
+            date = ''
+        raw.append({'filename': fname, 'info': info, 'size': size, 'date': date})
+
+    raw.sort(key=lambda f: (0 if f['info']['is_latest'] else 1, -f['info']['revnum'], f['filename']))
+
+    result = []
+    row_cycle = itertools.cycle(['odd', 'even'])
+    for f in raw:
+        row_class = next(row_cycle)
+        info = f['info']
+        own_text, own_class = _build_summary_for_file(
+            db, info['own_builder'], info['revision'], branch, row_class)
+        app_text, app_class = _build_summary_for_file(
+            db, info['app_builder'], info['revision'], branch, row_class)
+        text = f['filename']
+        if info['is_latest']:
+            text = f'<i>{text}</i>'
+        result.append({
+            'filename': f['filename'],
+            'text': text,
+            'href': f'/nightly/{branch}/{f["filename"]}',
+            'size': f['size'],
+            'date': f['date'],
+            'class': row_class,
+            'own_summary': own_text,
+            'own_summary_class': own_class,
+            'app_summary': app_text,
+            'app_summary_class': app_class,
+        })
+    return result
+
+
 @app.route("/nightly/")
-@app.route("/nightly/<path:rel_path>")
-def serve_nightly(rel_path=""):
-    full_path = os.path.join(NIGHTLY_ROOT, rel_path)
+def nightly_index():
+    branches = _nightly_index()
+    return render_template("nightly_index.html", branches=branches, page_title="Nightly Builds")
+
+
+@app.route("/nightly/trunk/")
+def nightly_trunk():
+    return redirect("/nightly/main/", code=301)
+
+
+@app.route("/nightly/<branch>/")
+def nightly_branch(branch):
+    files = _nightly_branch_data(branch)
+    return render_template(
+        "nightly_branch.html",
+        branch=branch, files=files,
+        page_title=f"Nightly — {branch}",
+    )
+
+
+@app.route("/nightly/<branch>/<filename>")
+def serve_nightly_file(branch, filename):
+    full_path = os.path.join(NIGHTLY_ROOT, branch, filename)
     if os.path.isfile(full_path):
-        return send_from_directory(NIGHTLY_ROOT, rel_path)
-    if os.path.isdir(full_path):
-        # Serve a directory listing of locally mirrored files with fallback links
-        entries = sorted(os.listdir(full_path)) if os.path.exists(full_path) else []
-        lines = [
-            f'<a href="{e}{"/" if os.path.isdir(os.path.join(full_path, e)) else ""}">{e}</a><br/>'
-            for e in entries
-        ]
-        fallback_url = f"{BUILDBOT_URL}/nightly/{rel_path}"
-        lines.append(
-            f'<br/><a href="{fallback_url}">Browse all on buildbot.pypy.org</a>'
-        )
-        return "\n".join(lines), 200, {"Content-Type": "text/html; charset=utf-8"}
-    # Not mirrored yet — redirect to buildbot
-    return redirect(f"{BUILDBOT_URL}/nightly/{rel_path}", code=302)
+        return send_from_directory(os.path.join(NIGHTLY_ROOT, branch), filename)
+    return redirect(f"{BUILDBOT_URL}/nightly/{branch}/{filename}", code=302)
+
+
+_BENCH_FILE_RE = re.compile(r'^(\d+)-([0-9a-f]+)-64\.json$')
+
+
+def _bench_files():
+    """Return list of benchmark file dicts, newest revision first."""
+    if not os.path.isdir(BENCH_ROOT):
+        return []
+    db = get_db()
+    files = []
+    for fname in os.listdir(BENCH_ROOT):
+        m = _BENCH_FILE_RE.match(fname)
+        if not m:
+            continue
+        revnum, rev_hash = int(m.group(1)), m.group(2)
+        revision = f"{revnum}:{rev_hash}"
+        fpath = os.path.join(BENCH_ROOT, fname)
+        try:
+            st = os.stat(fpath)
+            size = _format_size(st.st_size)
+        except OSError:
+            size = ''
+        date = ''
+        branch = ''
+        try:
+            with open(fpath, encoding='utf-8') as _f:
+                _data = json.load(_f)
+            rd = _data.get('revision_date', '')
+            if rd:
+                date = rd[:10]  # YYYY-MM-DD
+            branch = _data.get('branch', '')
+        except Exception:
+            pass
+        row = db.execute(
+            "SELECT number FROM builds WHERE builder = ? AND revision = ? LIMIT 1",
+            ("jit-benchmark-linux-x86-64", revision),
+        ).fetchone()
+        build_number = row['number'] if row else None
+        files.append({
+            'filename': fname,
+            'revnum': revnum,
+            'revision': revision,
+            'branch': branch,
+            'build_number': build_number,
+            'size': size,
+            'date': date,
+        })
+    files.sort(key=lambda f: -f['revnum'])
+    return files
+
+
+@app.route("/benchmark-results/")
+def benchmark_results():
+    files = _bench_files()
+    return render_template("benchmark_results.html", files=files, page_title="Benchmark Results")
+
+
+@app.route("/benchmark-results/<filename>")
+def serve_benchmark_file(filename):
+    local = os.path.join(BENCH_ROOT, filename)
+    if os.path.isfile(local):
+        return send_from_directory(BENCH_ROOT, filename, mimetype="application/json")
+    # Try colon variant on buildbot
+    bb_name = filename.replace('-', ':', 1)
+    return redirect(f"{BUILDBOT_URL}/benchmark-results/{bb_name}", code=302)
+
+
+@app.route("/sync-status")
+def sync_status():
+    db = get_db()
+    runs = db.execute(
+        """SELECT id, script, started, finished, status, items_synced, bytes_fetched
+           FROM sync_runs ORDER BY started DESC LIMIT 60"""
+    ).fetchall()
+    runs_data = []
+    for r in runs:
+        finished = r['finished']
+        duration = fmt_duration(r['started'], finished) if finished else 'running…'
+        runs_data.append({
+            'id': r['id'],
+            'script': r['script'],
+            'started': fmt_time(r['started']),
+            'duration': duration,
+            'status': r['status'],
+            'items_synced': r['items_synced'],
+            'bytes_fetched': _format_size(r['bytes_fetched']),
+            'has_output': bool(r['bytes_fetched'] is not None),
+        })
+    return render_template("sync_status.html", runs=runs_data, page_title="Sync Status")
+
+
+@app.route("/sync-log/<int:run_id>")
+def sync_log(run_id):
+    db = get_db()
+    row = db.execute("SELECT script, started, output FROM sync_runs WHERE id=?", (run_id,)).fetchone()
+    if not row:
+        abort(404)
+    output = row['output'] or '(no output captured)'
+    title = f"{row['script']} — {fmt_time(row['started'])}"
+    return render_template("sync_log.html", title=title, output=output, page_title=f"Sync log #{run_id}")
 
 
 @app.route("/static/<path:filename>")

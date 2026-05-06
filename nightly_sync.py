@@ -3,10 +3,11 @@ Mirror nightly tarballs from buildbot.pypy.org into a local NIGHTLY_ROOT directo
 Run as a cron job after the poller.
 
 Usage:
-    python nightly_sync.py [--nightly-root path] [--revisions N] [--branches b1,b2]
+    python nightly_sync.py [--nightly-root path] [--days N] [--branches b1,b2]
 """
 
 import argparse
+import datetime
 import logging
 import os
 import re
@@ -14,7 +15,7 @@ import requests
 
 BUILDBOT_URL = "https://buildbot.pypy.org"
 DEFAULT_NIGHTLY_ROOT = "nightly"
-DEFAULT_REVISIONS = 10   # number of distinct revisions to mirror per branch
+DEFAULT_DAYS = 3
 REQUEST_TIMEOUT = 60
 
 log = logging.getLogger(__name__)
@@ -22,24 +23,26 @@ log = logging.getLogger(__name__)
 # Filename pattern: pypy-c-jit-{revnum}-{hash}-{platform}.{ext}
 #                   or pypy-c-jit-latest-{platform}.{ext}
 FILE_RE = re.compile(r'^(pypy-[^-]+-[^-]+-(\d+)-([0-9a-f]+)-[^.]+\.(tar\.bz2|zip))$')
-LATEST_RE = re.compile(r'^(pypy-[^-]+-[^-]+-latest-[^.]+\.(tar\.bz2|zip))$')
+
+# Matches a tarball href followed (within the same table row) by a YYYY-MM-DD date
+_ROW_RE = re.compile(
+    r'href="(pypy-[^"]+\.(?:tar\.bz2|zip))".*?(\d{4}-\d{2}-\d{2})',
+    re.DOTALL,
+)
 
 
 def list_branch(branch):
-    """Return (dated_files, latest_files) from the branch listing page."""
+    """Return list of (filename, date_str) for dated tarballs on the branch."""
     url = f"{BUILDBOT_URL}/nightly/{branch}/"
     r = requests.get(url, timeout=REQUEST_TIMEOUT)
     if r.status_code == 404:
-        return [], []
+        return []
     r.raise_for_status()
-    links = re.findall(r'href="([^"?#]+)"', r.text)
-    dated, latest = [], []
-    for l in links:
-        if FILE_RE.match(l):
-            dated.append(l)
-        elif LATEST_RE.match(l):
-            latest.append(l)
-    return dated, latest
+    dated = []
+    for fname, date_str in _ROW_RE.findall(r.text):
+        if FILE_RE.match(fname):
+            dated.append((fname, date_str))
+    return dated
 
 
 def revision_key(filename):
@@ -48,6 +51,10 @@ def revision_key(filename):
     if m:
         return (int(m.group(2)), m.group(3))
     return None
+
+
+def _cutoff_date(days):
+    return (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
 
 
 def list_branches():
@@ -60,66 +67,112 @@ def list_branches():
     return [l.rstrip("/") for l in links if l.endswith("/") and not l.startswith((".", "/", "http"))]
 
 
-def download_file(branch, filename, nightly_root):
+def download_file(branch, filename, nightly_root, date_str=None, dry_run=False):
+    """Return bytes downloaded, or 0 if already present or dry_run."""
     dest = os.path.join(nightly_root, branch, filename)
     if os.path.exists(dest):
-        log.debug("already have %s/%s", branch, filename)
-        return False
+        _log = log.info if dry_run else log.debug
+        _log("already have %s/%s", branch, filename)
+        return 0
+    if dry_run:
+        log.info("would download %s/%s", branch, filename)
+        return 0
     url = f"{BUILDBOT_URL}/nightly/{branch}/{filename}"
     log.info("downloading %s/%s", branch, filename)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
+    nbytes = 0
     with requests.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
         r.raise_for_status()
         with open(dest + ".tmp", "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
                 f.write(chunk)
+                nbytes += len(chunk)
     os.replace(dest + ".tmp", dest)
-    return True
+    if date_str:
+        try:
+            ts = datetime.datetime.strptime(date_str, "%Y-%m-%d").timestamp()
+            os.utime(dest, (ts, ts))
+        except (ValueError, OSError):
+            pass
+    return nbytes
 
 
-def sync_branch(branch, nightly_root, max_revisions):
-    dated, latest = list_branch(branch)
-    if not dated and not latest:
+def update_symlinks(branch_dir):
+    """Create/update latest-* symlinks from locally present dated files."""
+    # Find the highest-revnum file for each (platform, ext) combo
+    best = {}  # (platform, ext) -> (revnum, filename)
+    for fname in os.listdir(branch_dir):
+        if os.path.islink(fname):
+            continue
+        m = FILE_RE.match(fname)
+        if not m:
+            continue
+        revnum = int(m.group(2))
+        ext = m.group(4)  # 'tar.bz2' or 'zip'
+        platform = fname[:-len(ext)-1].rsplit('-', 1)[1]
+        key = (platform, ext)
+        if key not in best or revnum > best[key][0]:
+            best[key] = (revnum, fname)
+
+    for (platform, ext), (_, target) in best.items():
+        link_name = f"pypy-c-jit-latest-{platform}.{ext}"
+        link_path = os.path.join(branch_dir, link_name)
+        if os.path.islink(link_path):
+            if os.readlink(link_path) == target:
+                continue
+            os.unlink(link_path)
+        elif os.path.exists(link_path):
+            os.unlink(link_path)
+        os.symlink(target, link_path)
+        log.info("symlink %s -> %s", link_name, target)
+
+
+def sync_branch(branch, nightly_root, cutoff, run=None, dry_run=False):
+    dated = list_branch(branch)
+    if not dated:
         log.debug("branch %s: no files", branch)
         return
 
-    # Group dated files by (revnum, hash), preserving order (newest first from listing)
+    # Group dated files by (revnum, hash), filter by date
     seen_revs = {}
-    for f in dated:
-        key = revision_key(f)
+    for fname, date_str in dated:
+        if date_str < cutoff:
+            continue
+        key = revision_key(fname)
         if key:
-            seen_revs.setdefault(key, []).append(f)
+            seen_revs.setdefault(key, []).append((fname, date_str))
 
-    # Sort by revnum descending, take last N revisions
-    revisions = sorted(seen_revs.keys(), reverse=True)[:max_revisions]
-    log.info("branch %s: mirroring %d/%d revisions", branch, len(revisions), len(seen_revs))
+    if not seen_revs:
+        log.debug("branch %s: no files since %s", branch, cutoff)
+        return
+
+    revisions = sorted(seen_revs.keys(), reverse=True)
+    log.info("branch %s: %d revisions since %s", branch, len(revisions), cutoff)
+
+    branch_dir = os.path.join(nightly_root, branch)
+    if not dry_run:
+        os.makedirs(branch_dir, exist_ok=True)
 
     for rev_key in revisions:
-        for filename in seen_revs[rev_key]:
-            download_file(branch, filename, nightly_root)
+        for filename, date_str in seen_revs[rev_key]:
+            nbytes = download_file(branch, filename, nightly_root, date_str=date_str, dry_run=dry_run)
+            if run and nbytes > 0:
+                run.items_synced += 1
+                run.bytes_fetched += nbytes
 
-    # Also mirror "latest" symlinks (small, just re-download each time)
-    for filename in latest:
-        dest = os.path.join(nightly_root, branch, filename)
-        url = f"{BUILDBOT_URL}/nightly/{branch}/{filename}"
-        log.info("updating latest: %s/%s", branch, filename)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with requests.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
-            if r.status_code == 404:
-                continue
-            r.raise_for_status()
-            with open(dest + ".tmp", "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    f.write(chunk)
-        os.replace(dest + ".tmp", dest)
+    if not dry_run:
+        update_symlinks(branch_dir)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Mirror nightly builds from buildbot.pypy.org")
     parser.add_argument("--nightly-root", default=DEFAULT_NIGHTLY_ROOT)
-    parser.add_argument("--revisions", type=int, default=DEFAULT_REVISIONS,
-                        help="Number of recent revisions to mirror per branch")
+    parser.add_argument("--days", type=int, default=DEFAULT_DAYS,
+                        help="Mirror files from the last N days (default: %(default)s)")
     parser.add_argument("--branches", help="Comma-separated list of branches (default: all)")
+    parser.add_argument("--db", default="pypy_summary.sqlite")
+    parser.add_argument("--dry-run", "-n", action="store_true",
+                        help="Report what would be downloaded without downloading")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -128,19 +181,24 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    from sync_util import SyncRun
     os.makedirs(args.nightly_root, exist_ok=True)
+    cutoff = _cutoff_date(args.days)
+    log.info("%s files dated >= %s", "dry-run:" if args.dry_run else "mirroring", cutoff)
 
     if args.branches:
         branches = [b.strip() for b in args.branches.split(",")]
     else:
         branches = list_branches()
         log.info("found branches: %s", branches)
+    branches = [b for b in branches if b != 'trunk']
 
-    for branch in branches:
-        try:
-            sync_branch(branch, args.nightly_root, args.revisions)
-        except Exception:
-            log.exception("failed syncing branch %s", branch)
+    with SyncRun("nightly", args.db) as run:
+        for branch in branches:
+            try:
+                sync_branch(branch, args.nightly_root, cutoff, run, dry_run=args.dry_run)
+            except Exception:
+                log.exception("failed syncing branch %s", branch)
 
 
 if __name__ == "__main__":
