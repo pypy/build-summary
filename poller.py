@@ -270,16 +270,13 @@ def extract_property(properties, key):
 def process_build(db, log_root, builder, build_data):
     number = build_data["number"]
 
-    if not build_data.get("times") or build_data["times"][1] is None:
-        log.debug("%s #%d still running, skipping", builder, number)
-        return False  # not finished
-
     props = build_data.get("properties", [])
     revision = extract_property(props, "got_revision") or extract_property(props, "revision") or ""
     branch = extract_property(props, "branch") or ""
     slave = extract_property(props, "slavename") or ""
     reason = extract_property(props, "reason") or ""
-    started, finished = build_data["times"]
+    times = build_data.get("times") or [None, None]
+    started, finished = times[0], times[1]
     result = build_data.get("results")
     if isinstance(result, list):
         result = result[0]
@@ -287,6 +284,10 @@ def process_build(db, log_root, builder, build_data):
     build_id = insert_build(db, builder, number, revision, branch, started, finished, result, slave, reason)
     insert_steps(db, build_id, build_data.get("steps", []))
     insert_properties(db, build_id, props)
+
+    if finished is None:
+        log.debug("%s #%d still running", builder, number)
+        return False
 
     already_have_outcomes = db.execute(
         "SELECT 1 FROM outcomes WHERE build_id = ? LIMIT 1", (build_id,)

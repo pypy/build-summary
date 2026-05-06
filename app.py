@@ -409,6 +409,7 @@ def summary():
         JOIN builders bl ON b.builder = bl.name
         WHERE b.finished > ? AND b.finished IS NOT NULL
     """
+    prefix = request.args.get("prefix")
     params = [cutoff]
     if category:
         query += " AND bl.category = ?"
@@ -416,6 +417,9 @@ def summary():
     if branch:
         query += " AND b.branch = ?"
         params.append(branch)
+    if prefix:
+        query += " AND b.builder LIKE ?"
+        params.append(prefix + "%")
     query += " ORDER BY b.started"
 
     builds = db.execute(query, params).fetchall()
@@ -452,13 +456,15 @@ def builders():
 
     def last_build_for_branch(builder_name, branch):
         r = db.execute(
-            """SELECT number, result FROM builds
+            """SELECT number, result, finished FROM builds
                WHERE builder = ? AND branch = ?
                ORDER BY number DESC LIMIT 1""",
             (builder_name, branch),
         ).fetchone()
         if r is None:
             return "—", "", ""
+        if r["finished"] is None:
+            return r["number"], "running", "running"
         return r["number"], RESULT_TEXT.get(r["result"], "—"), RESULT_CSS.get(r["result"], "")
 
     builders_data = []
@@ -576,8 +582,8 @@ def build(name, number):
         revision=b["revision"] or "", branch=b["branch"] or "",
         started_fmt=fmt_time(b["started"]),
         duration=fmt_duration(b["started"], b["finished"]),
-        result_text=RESULT_TEXT.get(b["result"], "—"),
-        result_css=RESULT_CSS.get(b["result"], ""),
+        result_text=RESULT_TEXT.get(b["result"], "running" if b["finished"] is None else "—"),
+        result_css=RESULT_CSS.get(b["result"], "running" if b["finished"] is None else ""),
         slave=b["slave"] or "", reason=b["reason"] or "",
         steps=steps_data, props=props_data,
         page_title=f"{name} #{number}",

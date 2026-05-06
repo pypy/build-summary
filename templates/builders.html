@@ -1,12 +1,13 @@
 {% extends "layout.html" %}
 {% block content %}
 <h2>Builders</h2>
-<table class="results">
-<tr><th>Builder</th><th>Category</th><th>main #</th><th>main status</th><th>py3.11 #</th><th>py3.11 status</th></tr>
+<table class="info">
+<tr><th rowspan="2">Builder</th><th rowspan="2">Category</th><th colspan="2" style="text-align:center">main</th><th colspan="2" style="text-align:center">py3.11</th></tr>
+<tr><th>last #</th><th>status</th><th>last #</th><th>status</th></tr>
 {% for b in builders %}
 <tr>
-  <td><a href="/builders/{{ b.name }}">{{ b.name }}</a></td>
-  <td>{{ b.category }}</td>
+  <td class="left"><a href="/builders/{{ b.name }}">{{ b.name }}</a></td>
+  <td class="left">{{ b.category }}</td>
   <td>{% if b.main_number != '—' %}<a href="/builders/{{ b.name }}/builds/{{ b.main_number }}">{{ b.main_number }}</a>{% else %}—{% endif %}</td>
   <td class="result {{ b.main_css }}">{{ b.main_text }}</td>
   <td>{% if b.py311_number != '—' %}<a href="/builders/{{ b.name }}/builds/{{ b.py311_number }}">{{ b.py311_number }}</a>{% else %}—{% endif %}</td>
