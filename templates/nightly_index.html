@@ -1,0 +1,26 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Nightly Builds</h2>
+
+{% set row_cycle = cycler('odd', 'even') %}
+<table class="listing">
+<tr class="{{ row_cycle.next() }}">
+  <th>Branch</th>
+  <th>Size</th>
+  <th>Date</th>
+</tr>
+{% for b in branches %}
+<tr class="{{ row_cycle.next() }}">
+  <td><a href="/nightly/{{ b.name }}/"><b>{{ b.name }}</b></a></td>
+  <td>{{ b.size }}</td>
+  <td>{{ b.date }}</td>
+</tr>
+{% else %}
+<tr class="{{ row_cycle.next() }}">
+  <td colspan="3">No nightly builds mirrored yet. Run <code>nightly_sync.py</code> to populate.</td>
+</tr>
+{% endfor %}
+</table>
+
+<p><a href="{{ buildbot_url }}/nightly/">Browse all on buildbot.pypy.org</a></p>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Benchmark Results</h2>
+
+<table class="listing">
+<tr class="odd">
+  <th>Revision</th>
+  <th>Branch</th>
+  <th>Date</th>
+  <th>Size</th>
+  <th>Build</th>
+</tr>
+{% set row_cycle = cycler('even', 'odd') %}
+{% for f in files %}
+<tr class="{{ row_cycle.next() }}">
+  <td><a href="/benchmark-results/{{ f.filename }}">{{ f.revision }}</a></td>
+  <td>{{ f.branch }}</td>
+  <td>{{ f.date }}</td>
+  <td>{{ f.size }}</td>
+  <td>{% if f.build_number %}<a href="/builders/jit-benchmark-linux-x86-64/builds/{{ f.build_number }}">#{{ f.build_number }}</a>{% endif %}</td>
+</tr>
+{% else %}
+<tr class="even"><td colspan="5">No benchmark results mirrored yet. Run <code>benchmark_sync.py</code> to populate.</td></tr>
+{% endfor %}
+</table>
+
+<p><a href="{{ buildbot_url }}/benchmark-results/">Browse all on buildbot.pypy.org</a></p>
+{% endblock %}

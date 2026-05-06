@@ -1,0 +1,36 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Nightly Builds — {{ branch }}</h2>
+
+{% set has_tests = files | selectattr('own_summary') | list | length > 0
+                or files | selectattr('app_summary') | list | length > 0 %}
+
+<table class="listing">
+{% if files %}
+<tr class="odd">
+  <th>Filename</th>
+  <th>Size</th>
+  <th>Date</th>
+  {% if has_tests %}
+  <th><i>own</i> tests</th>
+  <th><i>applevel</i> tests</th>
+  {% endif %}
+</tr>
+{% for f in files %}
+<tr class="{{ f.class }}">
+  <td><a href="{{ f.href }}">{{ f.text | safe }}</a></td>
+  <td>{{ f.size }}</td>
+  <td>{{ f.date }}</td>
+  {% if has_tests %}
+  <td class="{{ f.own_summary_class }}">{{ f.own_summary | safe }}</td>
+  <td class="{{ f.app_summary_class }}">{{ f.app_summary | safe }}</td>
+  {% endif %}
+</tr>
+{% else %}
+<tr class="odd"><td colspan="{% if has_tests %}5{% else %}3{% endif %}">No files mirrored for this branch yet.</td></tr>
+{% endfor %}
+{% endif %}
+</table>
+
+<p><a href="{{ buildbot_url }}/nightly/{{ branch }}/">Browse all on buildbot.pypy.org</a></p>
+{% endblock %}
