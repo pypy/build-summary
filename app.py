@@ -1,4 +1,5 @@
 import datetime
+import functools
 import itertools
 import json
 import os
@@ -11,6 +12,21 @@ import urllib.parse
 from importlib.metadata import version as pkg_version
 
 from buildbot_sync import parse_pytest_log, parse_xml_log
+
+try:
+    from compression.zstd import decompress as _zstd_decompress
+except ImportError:
+    import zstandard as _zstd
+    def _zstd_decompress(data): return _zstd.ZstdDecompressor().decompress(data)
+
+
+def read_log_file(path):
+    """Read a log file, decompressing .zst files transparently."""
+    if path.endswith(".zst"):
+        with open(path, "rb") as f:
+            return _zstd_decompress(f.read()).decode("utf-8", errors="replace")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
 
 from flask import (
     Flask,
@@ -29,7 +45,7 @@ BENCH_ROOT = os.environ.get("BENCH_ROOT", "benchmark-results")
 BUILDBOT_URL = "https://buildbot.pypy.org"
 DAYS_DEFAULT = 14
 REVS_DEFAULT = 5
-VERSION = "0.2"
+VERSION = "0.3"
 
 app = Flask(__name__)
 
@@ -158,6 +174,25 @@ def short_builder(name):
 # ---------------------------------------------------------------------------
 
 import html as _html
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_outcomes(build_id):
+    """Return {test_name: outcome_char} for a build, parsing pytestLog from disk."""
+    db = get_db()
+    row = db.execute(
+        "SELECT path FROM logs WHERE build_id = ? AND log_name = 'pytestLog' LIMIT 1",
+        (build_id,),
+    ).fetchone()
+    if not row:
+        return {}
+    log_path = os.path.join(LOG_ROOT, row["path"])
+    try:
+        text = read_log_file(log_path)
+    except OSError:
+        return {}
+    parse = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
+    return {name: outcome for name, outcome, _ in parse(text)}
 
 
 def _outcome_counts(outcomes, tests_pass=None):
@@ -428,19 +463,7 @@ def summary():
     builds = db.execute(query, params).fetchall()
     build_ids = [b["id"] for b in builds]
 
-    outcomes_by_build = {}
-    if build_ids:
-        placeholders = ",".join("?" * len(build_ids))
-        rows = db.execute(
-            f"""SELECT o.build_id, t.name AS test_name, o.outcome
-                FROM outcomes o JOIN test_names t ON o.test_name_id = t.id
-                WHERE o.build_id IN ({placeholders})""",
-            build_ids,
-        ).fetchall()
-        for row in rows:
-            outcomes_by_build.setdefault(row["build_id"], {})[row["test_name"]] = row[
-                "outcome"
-            ]
+    outcomes_by_build = {bid: _get_outcomes(bid) for bid in build_ids}
 
     sections = build_sections(builds, outcomes_by_build, max_revs=max_revs)
 
@@ -613,8 +636,7 @@ def longrepr(build_id, test_name):
 
     log_path = os.path.join(LOG_ROOT, log_row["path"])
     try:
-        with open(log_path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        text = read_log_file(log_path)
     except OSError:
         abort(404)
 

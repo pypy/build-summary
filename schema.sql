@@ -47,20 +47,6 @@ CREATE TABLE IF NOT EXISTS properties (
     PRIMARY KEY(build_id, name)
 );
 
-CREATE TABLE IF NOT EXISTS test_names (
-    id   INTEGER PRIMARY KEY,
-    name TEXT    NOT NULL UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS outcomes (
-    build_id     INTEGER NOT NULL REFERENCES builds(id),
-    test_name_id INTEGER NOT NULL REFERENCES test_names(id),
-    outcome      TEXT    NOT NULL,  -- F . s x X !
-    PRIMARY KEY(build_id, test_name_id)
-);
-
-CREATE INDEX IF NOT EXISTS outcomes_build_id ON outcomes(build_id);
-
 -- Tracks which log files have been fetched and where they live on disk.
 -- nginx serves these directly; Flask never touches them.
 CREATE TABLE IF NOT EXISTS logs (

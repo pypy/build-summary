@@ -15,6 +15,12 @@ import time
 
 import requests
 
+try:
+    from compression.zstd import compress as _zstd_compress
+except ImportError:
+    import zstandard as _zstd
+    def _zstd_compress(data): return _zstd.ZstdCompressor().compress(data)
+
 BUILDBOT_URL = "https://buildbot.pypy.org"
 DEFAULT_DB = "pypy_summary.sqlite"
 DEFAULT_LOG_ROOT = "logs"
@@ -111,38 +117,16 @@ def insert_properties(db, build_id, properties):
     )
 
 
-def get_or_create_test_name_ids(db, names):
-    """Return {name: id} for all given test names, inserting missing ones."""
-    if not names:
-        return {}
-    placeholders = ",".join("?" * len(names))
-    names = list(names)
-    db.executemany(
-        "INSERT OR IGNORE INTO test_names(name) VALUES (?)",
-        [(n,) for n in names],
+def save_pytest_log(db, build_id, builder, number, step_name, text, log_root):
+    """Save pytestLog to disk, record in logs table, update tests_pass count."""
+    outcomes = list(
+        parse_xml_log(text) if text.lstrip().startswith("<?xml") else parse_pytest_log(text)
     )
-    rows = db.execute(
-        f"SELECT id, name FROM test_names WHERE name IN ({placeholders})", names
-    ).fetchall()
-    return {row["name"]: row["id"] for row in rows}
-
-
-def insert_outcomes(db, build_id, outcomes):
-    outcomes = list(outcomes)
     pass_count = sum(1 for _, o, _ in outcomes if o == ".")
-    non_passing = [(n, o, r) for n, o, r in outcomes if o != "."]
-    name_to_id = get_or_create_test_name_ids(db, [n for n, _, _ in non_passing])
-    db.executemany(
-        """
-        INSERT OR IGNORE INTO outcomes(build_id, test_name_id, outcome)
-        VALUES (?, ?, ?)
-        """,
-        [(build_id, name_to_id[name], outcome) for name, outcome, _ in non_passing],
-    )
-    db.execute(
-        "UPDATE builds SET tests_pass = ? WHERE id = ?",
-        (pass_count, build_id),
-    )
+    db.execute("UPDATE builds SET tests_pass = ? WHERE id = ?", (pass_count, build_id))
+    path = save_log_file(log_root, builder, number, step_name, "pytestLog", text, ext=".txt")
+    insert_log(db, build_id, step_name, "pytestLog", path)
+    return len(outcomes)
 
 
 def insert_log(db, build_id, step_name, log_name, path):
@@ -245,13 +229,22 @@ def fetch_log_html(builder, number, step, log_name):
     return html
 
 
+LOG_COMPRESS_LIMIT = 4096  # bytes; compress logs larger than this
+
+
 def save_log_file(log_root, builder, number, step, log_name, text, ext=".txt"):
     dir_path = os.path.join(log_root, builder, str(number), step)
     os.makedirs(dir_path, exist_ok=True)
-    file_path = os.path.join(dir_path, log_name + ext)
-    with open(file_path, "w", encoding="utf-8", errors="replace") as f:
-        f.write(text)
-    # Return path relative to log_root for storage in DB
+    data = text.encode("utf-8", errors="replace")
+    if len(data) > LOG_COMPRESS_LIMIT:
+        ext = ext + ".zst"
+        file_path = os.path.join(dir_path, log_name + ext)
+        with open(file_path, "wb") as f:
+            f.write(_zstd_compress(data))
+    else:
+        file_path = os.path.join(dir_path, log_name + ext)
+        with open(file_path, "wb") as f:
+            f.write(data)
     return os.path.relpath(file_path, log_root)
 
 
@@ -289,11 +282,11 @@ def process_build(db, log_root, builder, build_data):
         log.debug("%s #%d still running", builder, number)
         return False
 
-    already_have_outcomes = db.execute(
-        "SELECT 1 FROM outcomes WHERE build_id = ? LIMIT 1", (build_id,)
+    already_have_log = db.execute(
+        "SELECT 1 FROM logs WHERE build_id = ? AND log_name = 'pytestLog' LIMIT 1", (build_id,)
     ).fetchone() is not None
 
-    if not already_have_outcomes:
+    if not already_have_log:
         for step in build_data.get("steps", []):
             step_name = step["name"]
             log_names = [l[0] for l in step.get("logs", [])]
@@ -303,12 +296,8 @@ def process_build(db, log_root, builder, build_data):
                     text = fetch_log_text(builder, number, step_name, log_name)
                     if text is None:
                         continue
-                    if text.lstrip().startswith("<?xml"):
-                        outcomes = list(parse_xml_log(text))
-                    else:
-                        outcomes = list(parse_pytest_log(text))
-                    insert_outcomes(db, build_id, outcomes)
-                    log.info("%s #%d step %s: %d outcomes", builder, number, step_name, len(outcomes))
+                    n = save_pytest_log(db, build_id, builder, number, step_name, text, log_root)
+                    log.info("%s #%d step %s: %d outcomes", builder, number, step_name, n)
                 # stdio and other logs: redirect to buildbot HTML viewer (see app.py serve_log)
 
     return True
