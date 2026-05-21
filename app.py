@@ -176,6 +176,32 @@ def short_builder(name):
 import html as _html
 
 
+def _display_rev(rev_str):
+    """Strip the numeric sort prefix, leaving just the hash."""
+    return rev_str.split(":", 1)[-1] if ":" in rev_str else rev_str
+
+
+def _lookup_outcome(outcomes, test_name):
+    """Look up outcome for test_name, with prefix fallback.
+
+    When one build records a module-level collection failure as 'pkg/test.py'
+    and another records individual results as 'pkg/test.py::Class::test_foo',
+    the prefix scan lets the latter show '.' instead of blank.
+    """
+    exact = outcomes.get(test_name)
+    if exact is not None:
+        return exact
+    prefix = test_name + "::"
+    sub = [o for name, o in outcomes.items() if name.startswith(prefix)]
+    if not sub:
+        return " "
+    if any(o in ("F", "!") for o in sub):
+        return "F" if "F" in sub else "!"
+    if all(o == "." for o in sub):
+        return "."
+    return sub[0]
+
+
 @functools.lru_cache(maxsize=1024)
 def _get_outcomes(build_id):
     """Return {test_name: outcome_char} for a build, parsing pytestLog from disk."""
@@ -217,6 +243,7 @@ def render_section_pre(
     matrix_rows,
     outcomes_by_build,
     tests_pass_by_bid=None,
+    bid_to_number=None,
 ):
     """
     Render section as <pre> with embedded links/spans, matching buildbot's layout.
@@ -228,7 +255,7 @@ def render_section_pre(
     if n == 0:
         return "<pre>(no builds)</pre>"
 
-    revsize = max(len(r["revision"]) for r in revisions)
+    revsize = max(len(_display_rev(r["revision"])) for r in revisions)
     # align = total chars before builder info on each staircase line
     align = 2 * n - 1 + revsize
     lines = []
@@ -237,8 +264,9 @@ def render_section_pre(
     for i, rev in enumerate(revisions):
         bars = " |" * i
         rev_str = rev["revision"]
-        rev_link = f'<a href="{rev["rev_url"]}">{_html.escape(rev_str)}</a>'
-        padding = " " * (align - 2 * i - 1 - len(rev_str))
+        display = _display_rev(rev_str)
+        rev_link = f'<a href="{rev["rev_url"]}">{_html.escape(display)}</a>'
+        padding = " " * (align - 2 * i - 1 - len(display))
         builder_parts = []
         for bshort in sorted(all_builders):
             bid = builds_by_rev_builder.get(rev_str, {}).get(bshort)
@@ -247,7 +275,9 @@ def render_section_pre(
             outcomes = outcomes_by_build.get(bid, {})
             tp = (tests_pass_by_bid or {}).get(bid)
             ndot, nF, ns, nx = _outcome_counts(outcomes, tests_pass=tp)
-            blink = f'<a class="failSummary builder" href="/builders/{_html.escape(full_name[bshort])}">{_html.escape(bshort)}</a>'
+            number = (bid_to_number or {}).get(bid)
+            href = f"/builders/{_html.escape(full_name[bshort])}/builds/{number}" if number else f"/builders/{_html.escape(full_name[bshort])}"
+            blink = f'<a class="failSummary builder" href="{href}">{_html.escape(bshort)}</a>'
             builder_parts.append(f"{blink} [{ndot}, {nF} F, {ns} s, {nx} x]")
         builder_info = "  ".join(builder_parts)
         lines.append(f"{bars} {rev_link}{padding}  {builder_info}  ({rev['date']})\n")
@@ -281,7 +311,7 @@ def render_section_pre(
             rev_str = rev["revision"]
             bid = builds_by_rev_builder.get(rev_str, {}).get(row["builder"])
             outcome = (
-                outcomes_by_build.get(bid, {}).get(row["test_name"], " ")
+                _lookup_outcome(outcomes_by_build.get(bid, {}), row["test_name"])
                 if bid
                 else " "
             )
@@ -315,9 +345,14 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
     for section_idx, ((category, branch), group_builds) in enumerate(
         sorted(groups.items(), key=lambda kv: (category_sort_key(kv[0][0]), kv[0][1]))
     ):
+        rev_to_ts = {}
+        for b in group_builds:
+            rev = b["revision"] or ""
+            rev_to_ts[rev] = max(rev_to_ts.get(rev, 0), b["started"] or 0)
+
         revisions_sorted = sorted(
             {b["revision"] for b in group_builds if b["revision"]},
-            key=revision_sort_key,
+            key=lambda r: rev_to_ts.get(r, 0),
         )[-max_revs:]
 
         # builds_by_rev_builder[rev][builder_short] = build_id
@@ -339,11 +374,13 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
                 rev_meta[rev] = {
                     "revision": rev,
                     "date": fmt_time(b["started"])[:10] if b["started"] else "",
-                    "rev_url": f"{BUILDBOT_URL}/builders/{b['builder']}/builds/{b['number']}",
+                    "rev_url": f"/revision/{_display_rev(rev)}?category={category}",
                 }
 
         revisions = [rev_meta[r] for r in revisions_sorted if r in rev_meta]
         n = len(revisions)
+
+        bid_to_number = {b["id"]: b["number"] for b in group_builds}
 
         # bid_to_builder[build_id] = builder_short
         bid_to_builder = {}
@@ -357,22 +394,26 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
             for rev in revisions
             for bid in builds_by_rev_builder.get(rev["revision"], {}).values()
         }
-        error_keys = set()
+        error_keys = {}  # (bshort, tname) -> worst outcome ("!" beats "F")
         for bid in displayed_bids:
             bshort = bid_to_builder.get(bid)
             if bshort is None:
                 continue
             for tname, outcome in outcomes_by_build.get(bid, {}).items():
                 if outcome in ("F", "!"):
-                    error_keys.add((bshort, tname))
+                    key = (bshort, tname)
+                    if error_keys.get(key) != "!":
+                        error_keys[key] = outcome
 
         matrix_rows = []
-        for bshort, tname in sorted(error_keys):
+        for (bshort, tname), worst in sorted(
+            error_keys.items(), key=lambda kv: (0 if kv[1] == "!" else 1, kv[0])
+        ):
             combination = 0
             for i, rev in enumerate(revisions):
                 bid = builds_by_rev_builder.get(rev["revision"], {}).get(bshort)
                 if bid:
-                    outcome = outcomes_by_build.get(bid, {}).get(tname, " ")
+                    outcome = _lookup_outcome(outcomes_by_build.get(bid, {}), tname)
                     if outcome in ("F", "!"):
                         combination |= 1 << i
             matrix_rows.append(
@@ -392,6 +433,7 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
             matrix_rows,
             outcomes_by_build,
             tests_pass_by_bid,
+            bid_to_number,
         )
 
         sections.append(
@@ -467,11 +509,39 @@ def summary():
 
     sections = build_sections(builds, outcomes_by_build, max_revs=max_revs)
 
+    last_build_date = None
+    suggested_days = None
+    if not sections:
+        max_query = """
+            SELECT MAX(b.finished) AS ts
+            FROM builds b
+            JOIN builders bl ON b.builder = bl.name
+            WHERE b.finished IS NOT NULL
+        """
+        max_params = []
+        if category:
+            max_query += " AND bl.category = ?"
+            max_params.append(category)
+        if branch:
+            max_query += " AND b.branch = ?"
+            max_params.append(branch)
+        if prefix:
+            max_query += " AND b.builder LIKE ?"
+            max_params.append(prefix + "%")
+        row = db.execute(max_query, max_params).fetchone()
+        if row and row["ts"]:
+            last_build_date = fmt_time(row["ts"])
+            age_days = (datetime.datetime.now(datetime.timezone.utc).timestamp() - row["ts"]) / 86400
+            suggested_days = int(age_days) + 2
+
     return render_template(
         "summary.html",
         sections=sections,
+        last_build_date=last_build_date,
+        suggested_days=suggested_days,
+        days=days,
         page_title="PyPy Build Summary",
-        now=fmt_time(datetime.datetime.utcnow().timestamp()),
+        now=fmt_time(datetime.datetime.now(datetime.timezone.utc).timestamp()),
     )
 
 
@@ -541,7 +611,7 @@ def builder(name):
         builder=name,
         builds=builds_data,
         page_title=name,
-        now=fmt_time(datetime.datetime.utcnow().timestamp()),
+        now=fmt_time(datetime.datetime.now(datetime.timezone.utc).timestamp()),
     )
 
 
@@ -661,11 +731,54 @@ def longrepr(build_id, test_name):
     return render_template("longrepr.html", page_title=test_name, body=body)
 
 
+@app.route("/revision/<sha>")
+def revision(sha):
+    db = get_db()
+    category = request.args.get("category")
+    query = """SELECT b.id, b.builder, b.number, b.branch, b.started, b.finished,
+                      b.result, b.tests_pass, bl.category
+               FROM builds b
+               JOIN builders bl ON b.builder = bl.name
+               WHERE (b.revision LIKE ? OR b.revision = ?)"""
+    params = [f"%:{sha}", sha]
+    if category:
+        query += " AND bl.category = ?"
+        params.append(category)
+    query += " ORDER BY b.builder, b.started"
+    builds = db.execute(query, params).fetchall()
+    if not builds:
+        abort(404)
+    builds_data = [
+        {
+            "builder": b["builder"],
+            "category": b["category"],
+            "number": b["number"],
+            "branch": b["branch"] or "",
+            "started_fmt": fmt_time(b["started"]),
+            "duration": fmt_duration(b["started"], b["finished"]),
+            "result_text": RESULT_TEXT.get(b["result"], "running"),
+            "css": RESULT_CSS.get(b["result"], ""),
+            "tests_pass": b["tests_pass"],
+        }
+        for b in builds
+    ]
+    return render_template(
+        "revision.html",
+        sha=sha,
+        builds=builds_data,
+        page_title=f"Revision {sha}",
+    )
+
+
 @app.route("/logs/<path:rel_path>")
 def serve_log(rel_path):
-    # rel_path is builder/number/step/logname.txt
+    # rel_path is builder/number/step/logname.txt[.zst]
     full_path = os.path.join(LOG_ROOT, rel_path)
     if os.path.exists(full_path):
+        if rel_path.endswith(".zst"):
+            from flask import Response
+            text = read_log_file(full_path)
+            return Response(text, mimetype="text/plain")
         mimetype = "text/html" if rel_path.endswith(".html") else "text/plain"
         return send_from_directory(LOG_ROOT, rel_path, mimetype=mimetype)
     # Reconstruct buildbot URL: builder/number/step/logname.{html,txt}

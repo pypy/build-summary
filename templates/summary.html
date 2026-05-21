@@ -23,6 +23,7 @@
 {% endblock %}
 
 {% block content %}
+{% if sections %}
 {% for section in sections %}
 <h2>
   <a name="{{ section.anchor }}"></a>
@@ -32,4 +33,15 @@
 </h2>
 {{ section.pre_html | safe }}
 {% endfor %}
+{% else %}
+<p>No builds found within the current window.
+{% if last_build_date %}
+  Most recent data: <b>{{ last_build_date }}</b>.
+  Try <a href="/summary?days={{ suggested_days }}">?days={{ suggested_days }}</a> to include it,
+  or run <code>buildbot_sync.py</code> to fetch fresh builds.
+{% else %}
+  Does the branch exist?
+{% endif %}
+</p>
+{% endif %}
 {% endblock %}
