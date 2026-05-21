@@ -1,6 +1,7 @@
 {% extends "layout.html" %}
 {% block content %}
 <h1>Builder <a href="/builders/{{ builder }}">{{ builder }}</a> Build #{{ number }}</h1>
+<p><a href="{{ summary_url }}">← summary</a></p>
 
 <div class="column">
 
@@ -9,8 +10,8 @@
 
 <h2>SourceStamp:</h2>
 <table class="info" width="100%">
-{% if branch %}<tr><td class="left">Branch</td><td>{{ branch }}</td></tr>{% endif %}
-{% if revision %}<tr class="alt"><td class="left">Revision</td><td>{{ revision }}</td></tr>{% endif %}
+{% if branch %}<tr><td class="left">Branch</td><td><a href="{{ branch_url }}">{{ branch }}</a></td></tr>{% endif %}
+{% if revision %}<tr class="alt"><td class="left">Revision</td><td><a href="{{ rev_url }}"><code>{{ revision }}</code></a></td></tr>{% endif %}
 </table>
 
 {% if slave %}<h2>BuildSlave:</h2><p>{{ slave }}</p>{% endif %}

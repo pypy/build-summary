@@ -1,0 +1,9 @@
+*.sqlite
+logs/
+nightly/
+benchmark-results/
+__pycache__/
+*.py[cod]
+*.swp
+.venv*/
+memory/

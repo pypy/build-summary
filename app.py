@@ -626,6 +626,9 @@ def build(name, number):
     if not b:
         abort(404)
 
+    cat_row = db.execute("SELECT category FROM builders WHERE name = ?", (name,)).fetchone()
+    category = cat_row["category"] if cat_row else ""
+
     # Local log paths keyed by (step_name, log_name)
     local_logs = {}
     for row in db.execute(
@@ -672,10 +675,26 @@ def build(name, number):
         (b["id"],),
     ).fetchall()
 
+    raw_rev = b["revision"] or ""
+    display_rev = _display_rev(raw_rev)
+    branch = b["branch"] or ""
+
+    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    age_days = int((now_ts - b["started"]) / 86400) + 2 if b["started"] else 0
+    summary_days = max(14, age_days)
+    cat_param = f"&category={category}" if category else ""
+    summary_url = (
+        f"/summary?branch={branch}{cat_param}&days={summary_days}"
+        if branch else f"/summary?days={summary_days}{cat_param}"
+    )
+
     return render_template(
         "build.html",
         builder=name, number=number,
-        revision=b["revision"] or "", branch=b["branch"] or "",
+        revision=display_rev, branch=branch,
+        rev_url=f"/revision/{display_rev}" if display_rev else "",
+        branch_url=f"/summary?branch={branch}" if branch else "",
+        summary_url=summary_url,
         started_fmt=fmt_time(b["started"]),
         duration=fmt_duration(b["started"], b["finished"]),
         result_text=RESULT_TEXT.get(b["result"], "running" if b["finished"] is None else "—"),

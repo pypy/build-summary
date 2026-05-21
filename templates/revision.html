@@ -1,0 +1,26 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Builds for revision <code>{{ sha }}</code></h2>
+<table class="builds">
+  <tr>
+    <th>Builder</th>
+    <th>Branch</th>
+    <th>Build</th>
+    <th>Started</th>
+    <th>Duration</th>
+    <th>Result</th>
+    <th>Passed</th>
+  </tr>
+  {% for b in builds %}
+  <tr class="{{ b.css }}">
+    <td><a href="/builders/{{ b.builder }}">{{ b.builder }}</a></td>
+    <td>{{ b.branch }}</td>
+    <td><a href="/builders/{{ b.builder }}/builds/{{ b.number }}">#{{ b.number }}</a></td>
+    <td>{{ b.started_fmt }}</td>
+    <td>{{ b.duration }}</td>
+    <td class="{{ b.css }}">{{ b.result_text }}</td>
+    <td>{{ b.tests_pass if b.tests_pass is not none else '—' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
