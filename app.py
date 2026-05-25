@@ -202,27 +202,35 @@ def _lookup_outcome(outcomes, test_name):
     return sub[0]
 
 
+_OUTCOME_PRIORITY = {"!": 3, "F": 2, "X": 1, "x": 1, "s": 1, ".": 0, " ": -1}
+
+
 @functools.lru_cache(maxsize=1024)
 def _get_outcomes(build_id):
-    """Return {test_name: outcome_char} for a build, parsing pytestLog from disk."""
+    """Return {test_name: outcome_char} for a build, merging all pytestLog steps."""
     db = get_db()
-    row = db.execute(
-        "SELECT path FROM logs WHERE build_id = ? AND log_name = 'pytestLog' LIMIT 1",
+    rows = db.execute(
+        "SELECT path FROM logs WHERE build_id = ? AND log_name = 'pytestLog' ORDER BY rowid",
         (build_id,),
-    ).fetchone()
-    if not row:
+    ).fetchall()
+    if not rows:
         return {}
-    log_path = os.path.join(LOG_ROOT, row["path"])
-    try:
-        text = read_log_file(log_path)
-    except OSError:
-        return {}
-    parse = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
-    return {name: outcome for name, outcome, _ in parse(text)}
+    combined = {}
+    for row in rows:
+        log_path = os.path.join(LOG_ROOT, row["path"])
+        try:
+            text = read_log_file(log_path)
+        except OSError:
+            continue
+        parse = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
+        for name, outcome, _ in parse(text):
+            if _OUTCOME_PRIORITY.get(outcome, 0) > _OUTCOME_PRIORITY.get(combined.get(name), -1):
+                combined[name] = outcome
+    return combined
 
 
 def _outcome_counts(outcomes, tests_pass=None):
-    nF = ns = nx = 0
+    nF = ns = nx = ndot = 0
     for o in outcomes.values():
         if o in ("F", "!"):
             nF += 1
@@ -230,7 +238,10 @@ def _outcome_counts(outcomes, tests_pass=None):
             ns += 1
         elif o == "x":
             nx += 1
-    ndot = tests_pass if tests_pass is not None else 0
+        elif o == ".":
+            ndot += 1
+    if not outcomes and tests_pass is not None:
+        ndot = tests_pass
     return ndot, nF, ns, nx
 
 
@@ -684,8 +695,8 @@ def build(name, number):
     summary_days = max(14, age_days)
     cat_param = f"&category={category}" if category else ""
     summary_url = (
-        f"/summary?branch={branch}{cat_param}&days={summary_days}"
-        if branch else f"/summary?days={summary_days}{cat_param}"
+        f"/summary?branch={branch}{cat_param}&days={summary_days}&prefix={name}"
+        if branch else f"/summary?days={summary_days}{cat_param}&prefix={name}"
     )
 
     return render_template(
