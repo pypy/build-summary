@@ -260,7 +260,7 @@ def extract_property(properties, key):
 # Core polling logic
 # ---------------------------------------------------------------------------
 
-def process_build(db, log_root, builder, build_data):
+def process_build(db, log_root, builder, build_data, skip_logs=False):
     number = build_data["number"]
 
     props = build_data.get("properties", [])
@@ -282,23 +282,23 @@ def process_build(db, log_root, builder, build_data):
         log.debug("%s #%d still running", builder, number)
         return False
 
-    already_have_log = db.execute(
-        "SELECT 1 FROM logs WHERE build_id = ? AND log_name = 'pytestLog' LIMIT 1", (build_id,)
-    ).fetchone() is not None
+    if not skip_logs:
+        already_have_log = db.execute(
+            "SELECT 1 FROM logs WHERE build_id = ? AND log_name = 'pytestLog' LIMIT 1", (build_id,)
+        ).fetchone() is not None
 
-    if not already_have_log:
-        for step in build_data.get("steps", []):
-            step_name = step["name"]
-            log_names = [l[0] for l in step.get("logs", [])]
-
-            for log_name in log_names:
-                if log_name == "pytestLog":
-                    text = fetch_log_text(builder, number, step_name, log_name)
-                    if text is None:
-                        continue
-                    n = save_pytest_log(db, build_id, builder, number, step_name, text, log_root)
-                    log.info("%s #%d step %s: %d outcomes", builder, number, step_name, n)
-                # stdio and other logs: redirect to buildbot HTML viewer (see app.py serve_log)
+        if not already_have_log:
+            for step in build_data.get("steps", []):
+                step_name = step["name"]
+                log_names = [l[0] for l in step.get("logs", [])]
+                for log_name in log_names:
+                    if log_name == "pytestLog":
+                        text = fetch_log_text(builder, number, step_name, log_name)
+                        if text is None:
+                            continue
+                        n = save_pytest_log(db, build_id, builder, number, step_name, text, log_root)
+                        log.info("%s #%d step %s: %d outcomes", builder, number, step_name, n)
+                    # stdio and other logs: redirect to buildbot HTML viewer (see app.py serve_log)
 
     return True
 
@@ -320,7 +320,7 @@ def discover_new_builds(builder, last, limit=INITIAL_BACKFILL):
     return sorted(new)
 
 
-def poll_builder(db, log_root, builder, category):
+def poll_builder(db, log_root, builder, category, skip_logs=False):
     upsert_builder(db, builder, category)
     last = get_last_build(db, builder)
 
@@ -334,7 +334,7 @@ def poll_builder(db, log_root, builder, category):
     for number in builds_to_fetch:
         try:
             build_data = bb_get(f"/json/builders/{builder}/builds/{number}")
-            finished = process_build(db, log_root, builder, build_data)
+            finished = process_build(db, log_root, builder, build_data, skip_logs=skip_logs)
             if finished:
                 new_last = max(new_last, number)
         except Exception:
@@ -346,11 +346,11 @@ def poll_builder(db, log_root, builder, category):
     db.commit()
 
 
-def poll_all(db, log_root):
+def poll_all(db, log_root, skip_logs=False):
     builders = bb_get("/json/builders/")
     for builder, info in builders.items():
         category = info.get("category", "")
-        poll_builder(db, log_root, builder, category)
+        poll_builder(db, log_root, builder, category, skip_logs=skip_logs)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +361,9 @@ def main():
     parser = argparse.ArgumentParser(description="Poll buildbot.pypy.org into SQLite")
     parser.add_argument("--db", default=DEFAULT_DB)
     parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT)
+    parser.add_argument("--master-root", default="",
+                        help="Path to buildbot master directory; if set, skip downloading "
+                             "log files (they will be read directly from the master)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -369,6 +372,13 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    skip_logs = False
+    if args.master_root:
+        if not os.path.isdir(args.master_root):
+            parser.error(f"--master-root {args.master_root!r} does not exist or is not a directory")
+        skip_logs = True
+        log.info("master-root %s found; skipping log downloads", args.master_root)
+
     from sync_util import SyncRun
     os.makedirs(args.log_root, exist_ok=True)
 
@@ -376,7 +386,7 @@ def main():
         db = open_db(args.db)
         start = time.time()
         before = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
-        poll_all(db, args.log_root)
+        poll_all(db, args.log_root, skip_logs=skip_logs)
         after = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
         run.items_synced = after - before
         log.info("done in %.1fs (%d new finished builds)", time.time() - start, run.items_synced)

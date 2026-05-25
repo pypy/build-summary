@@ -1,5 +1,7 @@
+import bz2
 import datetime
 import functools
+import glob
 import itertools
 import json
 import os
@@ -8,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import urllib.parse
+import urllib.request
 
 from importlib.metadata import version as pkg_version
 
@@ -20,11 +23,33 @@ except ImportError:
     def _zstd_decompress(data): return _zstd.ZstdDecompressor().decompress(data)
 
 
+def _strip_bb_chunks(data):
+    """Decode buildbot 0.8.x Netstring log format: {length}:{channel}{content},"""
+    result = []
+    pos = 0
+    while pos < len(data):
+        colon = data.find(b':', pos, pos + 15)
+        if colon == -1:
+            break
+        try:
+            length = int(data[pos:colon])
+        except ValueError:
+            break
+        content_start = colon + 2       # skip ':' and channel byte
+        content_end = colon + 1 + length
+        result.append(data[content_start:content_end])
+        pos = content_end + 1           # skip Netstring trailing ','
+    return b''.join(result).decode("utf-8", errors="replace")
+
+
 def read_log_file(path):
-    """Read a log file, decompressing .zst files transparently."""
+    """Read a log file, decompressing .zst or .bz2 transparently."""
     if path.endswith(".zst"):
         with open(path, "rb") as f:
             return _zstd_decompress(f.read()).decode("utf-8", errors="replace")
+    if path.endswith(".bz2"):
+        with open(path, "rb") as f:
+            return _strip_bb_chunks(bz2.decompress(f.read()))
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read()
 
@@ -40,6 +65,7 @@ from flask import (
 
 DB_PATH = os.environ.get("SUMMARY_DB", "pypy_summary.sqlite")
 LOG_ROOT = os.environ.get("LOG_ROOT", "logs")
+BUILDBOT_MASTER_ROOT = os.environ.get("BUILDBOT_MASTER_ROOT", "pypy-buildbot/master")
 NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "nightly")
 BENCH_ROOT = os.environ.get("BENCH_ROOT", "benchmark-results")
 BUILDBOT_URL = "https://buildbot.pypy.org"
@@ -202,24 +228,54 @@ def _lookup_outcome(outcomes, test_name):
     return sub[0]
 
 
+def _master_log_path(builder, number, step_name, log_name):
+    """Return absolute path to a log in BUILDBOT_MASTER_ROOT, or None."""
+    if not BUILDBOT_MASTER_ROOT or not os.path.isdir(BUILDBOT_MASTER_ROOT):
+        return None
+    base = os.path.join(BUILDBOT_MASTER_ROOT, builder, f"{number}-log-{step_name}-{log_name}")
+    for candidate in (base + ".bz2", base):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _pytestlog_paths(build_id):
+    """
+    Return ordered list of absolute pytestLog paths for a build.
+    Priority: LOG_ROOT (DB entries) → BUILDBOT_MASTER_ROOT.
+    """
+    db = get_db()
+    rows = db.execute(
+        "SELECT path FROM logs WHERE build_id = ? AND log_name = 'pytestLog' ORDER BY rowid",
+        (build_id,),
+    ).fetchall()
+    paths = [
+        os.path.join(LOG_ROOT, row["path"]) for row in rows
+        if os.path.exists(os.path.join(LOG_ROOT, row["path"]))
+    ]
+    if not paths and BUILDBOT_MASTER_ROOT and os.path.isdir(BUILDBOT_MASTER_ROOT):
+        build_row = db.execute(
+            "SELECT builder, number FROM builds WHERE id = ?", (build_id,)
+        ).fetchone()
+        if build_row:
+            pattern = os.path.join(
+                BUILDBOT_MASTER_ROOT, build_row["builder"],
+                f"{build_row['number']}-log-*-pytestLog*",
+            )
+            paths = sorted(glob.glob(pattern))
+    return paths
+
+
 _OUTCOME_PRIORITY = {"!": 3, "F": 2, "X": 1, "x": 1, "s": 1, ".": 0, " ": -1}
 
 
 @functools.lru_cache(maxsize=1024)
 def _get_outcomes(build_id):
     """Return {test_name: outcome_char} for a build, merging all pytestLog steps."""
-    db = get_db()
-    rows = db.execute(
-        "SELECT path FROM logs WHERE build_id = ? AND log_name = 'pytestLog' ORDER BY rowid",
-        (build_id,),
-    ).fetchall()
-    if not rows:
-        return {}
     combined = {}
-    for row in rows:
-        log_path = os.path.join(LOG_ROOT, row["path"])
+    for path in _pytestlog_paths(build_id):
         try:
-            text = read_log_file(log_path)
+            text = read_log_file(path)
         except OSError:
             continue
         parse = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
@@ -727,24 +783,18 @@ def longrepr(build_id, test_name):
     if not build:
         abort(404)
 
-    log_row = db.execute(
-        "SELECT path FROM logs WHERE build_id = ? AND log_name = 'pytestLog' LIMIT 1",
-        (build_id,),
-    ).fetchone()
-    if not log_row:
-        abort(404)
-
-    log_path = os.path.join(LOG_ROOT, log_row["path"])
-    try:
-        text = read_log_file(log_path)
-    except OSError:
-        abort(404)
-
     longrepr_text = None
-    parser = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
-    for name, outcome, repr_text in parser(text):
-        if name == test_name and repr_text:
-            longrepr_text = repr_text
+    for path in _pytestlog_paths(build_id):
+        try:
+            text = read_log_file(path)
+        except OSError:
+            continue
+        parser = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
+        for name, outcome, repr_text in parser(text):
+            if name == test_name and repr_text:
+                longrepr_text = repr_text
+                break
+        if longrepr_text:
             break
 
     if not longrepr_text:
@@ -802,25 +852,49 @@ def revision(sha):
 
 @app.route("/logs/<path:rel_path>")
 def serve_log(rel_path):
+    from flask import Response
+
     # rel_path is builder/number/step/logname.txt[.zst]
     full_path = os.path.join(LOG_ROOT, rel_path)
     if os.path.exists(full_path):
         if rel_path.endswith(".zst"):
-            from flask import Response
-            text = read_log_file(full_path)
-            return Response(text, mimetype="text/plain")
+            return Response(read_log_file(full_path), mimetype="text/plain")
         mimetype = "text/html" if rel_path.endswith(".html") else "text/plain"
         return send_from_directory(LOG_ROOT, rel_path, mimetype=mimetype)
-    # Reconstruct buildbot URL: builder/number/step/logname.{html,txt}
-    # → /builders/builder/builds/number/steps/step/logs/logname[/text]
+
     parts = rel_path.rstrip("/").split("/")
-    if len(parts) == 4:
-        builder, number, step, logfile = parts
-        log_name = logfile.removesuffix(".txt").removesuffix(".html")
-        suffix = "/text" if rel_path.endswith(".txt") else ""
-        fallback = f"{BUILDBOT_URL}/builders/{builder}/builds/{number}/steps/{step}/logs/{log_name}{suffix}"
-        return redirect(fallback, code=302)
-    abort(404)
+    if len(parts) != 4:
+        abort(404)
+    builder, number, step, logfile = parts
+    log_name = logfile
+    for suffix in (".txt.zst", ".txt", ".html"):
+        if log_name.endswith(suffix):
+            log_name = log_name[: -len(suffix)]
+            break
+
+    # Try BUILDBOT_MASTER_ROOT
+    master_path = _master_log_path(builder, number, step, log_name)
+    if master_path:
+        return Response(read_log_file(master_path), mimetype="text/plain")
+
+    # Last resort: proxy from buildbot.pypy.org with a banner
+    is_text = rel_path.endswith(".txt")
+    src_url = (
+        f"{BUILDBOT_URL}/builders/{builder}/builds/{number}"
+        f"/steps/{step}/logs/{log_name}" + ("/text" if is_text else "")
+    )
+    try:
+        with urllib.request.urlopen(src_url, timeout=30) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+        if is_text:
+            return Response(f"# Downloaded from: {src_url}\n" + content, mimetype="text/plain")
+        banner = (
+            f'<div class="buildbot-source-banner">'
+            f'Downloaded from: <a href="{src_url}">{src_url}</a></div>'
+        )
+        return Response(content.replace("<body>", f"<body>\n{banner}", 1), mimetype="text/html")
+    except Exception:
+        return redirect(src_url, code=302)
 
 
 _PYPY_PLATFORMS = {
