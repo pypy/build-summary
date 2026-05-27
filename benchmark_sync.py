@@ -22,18 +22,31 @@ REQUEST_TIMEOUT = 60
 
 log = logging.getLogger(__name__)
 
-# Revision format: "REVNUM:HASH" (hg) or bare hash
+# DB revision format: "REVNUM:HASH"
 _REV_RE = re.compile(r'^(\d+):([0-9a-f]+)$')
 
+# Filename format: {revnum}{sep}{hash}-64[-{machine}].json
+# sep can be : (original), - or _ (future-safe replacements)
+_FILE_RE = re.compile(r'^(\d+)(?::|[-_])([0-9a-f]+)-64(-[^.]+)?\.json$')
 
-def _local_filename(revision):
-    """Convert revision to local filename (colon → dash)."""
-    return revision.replace(':', '-') + '-64.json'
+
+def _parse_filename(filename):
+    """Return (revnum_int, hash_str) from a benchmark JSON filename, or None."""
+    m = _FILE_RE.match(filename)
+    return (int(m.group(1)), m.group(2)) if m else None
 
 
-def _buildbot_filename(revision):
-    """Filename as used in the buildbot URL."""
-    return revision + '-64.json'
+def _normalize_filename(filename):
+    """Normalize the revnum:hash separator to - for local storage."""
+    return re.sub(r'^(\d+)(?::|_)', lambda m: m.group(1) + '-', filename)
+
+
+def list_remote_files():
+    """Return list of benchmark JSON filenames from the buildbot index."""
+    r = requests.get(f"{BUILDBOT_URL}/benchmark-results/", timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return [f for f in re.findall(r'href="([^"?#/][^"]*\.json)"', r.text)
+            if _FILE_RE.match(f)]
 
 
 def sync(bench_root, db_path, source_root=None, run=None):
@@ -48,33 +61,49 @@ def sync(bench_root, db_path, source_root=None, run=None):
     ).fetchall()
     conn.close()
 
-    revisions = [r['revision'] for r in rows if _REV_RE.match(r['revision'])]
-    log.info("found %d revisions for %s", len(revisions), BUILDER_NAME)
+    known = set()
+    for r in rows:
+        m = _REV_RE.match(r['revision'])
+        if m:
+            known.add((int(m.group(1)), m.group(2)))
+    log.info("found %d revisions for %s", len(known), BUILDER_NAME)
 
-    for rev in revisions:
-        local_name = _local_filename(rev)
+    log.info("listing remote benchmark-results/")
+    remote_files = list_remote_files()
+    log.info("found %d remote JSON files", len(remote_files))
+
+    to_fetch = [f for f in remote_files if _parse_filename(f) in known]
+    log.info("%d files match known revisions", len(to_fetch))
+
+    for filename in to_fetch:
+        local_name = _normalize_filename(filename)
         dest = os.path.join(bench_root, local_name)
         if os.path.exists(dest):
             log.debug("already have %s", local_name)
             continue
 
-        # Check source root before hitting the network
         if source_root:
-            src = os.path.join(source_root, local_name)
-            if os.path.exists(src):
-                os.symlink(os.path.abspath(src), dest)
-                log.info("linked from source: %s", local_name)
-                if run:
-                    run.items_synced += 1
+            # Try normalized name first, then original (source may use : in name)
+            for candidate in dict.fromkeys([local_name, filename]):
+                src = os.path.join(source_root, candidate)
+                if os.path.exists(src):
+                    os.symlink(os.path.abspath(src), dest)
+                    log.info("linked from source: %s", candidate)
+                    if run:
+                        run.items_synced += 1
+                    break
+            else:
+                pass  # not in source, fall through to download
+
+            if os.path.exists(dest):
                 continue
 
-        bb_name = _buildbot_filename(rev)
-        url = f"{BUILDBOT_URL}/benchmark-results/{bb_name}"
-        log.debug("checking %s", bb_name)
+        url = f"{BUILDBOT_URL}/benchmark-results/{filename}"
+        log.debug("downloading %s", filename)
         try:
             with requests.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
                 if r.status_code == 404:
-                    log.debug("not found on buildbot: %s", bb_name)
+                    log.debug("not found on buildbot: %s", filename)
                     continue
                 r.raise_for_status()
                 data = b''
@@ -83,12 +112,12 @@ def sync(bench_root, db_path, source_root=None, run=None):
                         f.write(chunk)
                         data += chunk
             os.replace(dest + '.tmp', dest)
-            log.info("downloaded %s", bb_name)
+            log.info("downloaded %s", filename)
             if run:
                 run.items_synced += 1
                 run.bytes_fetched += len(data)
         except Exception:
-            log.exception("failed downloading %s", bb_name)
+            log.exception("failed downloading %s", filename)
             if os.path.exists(dest + '.tmp'):
                 os.unlink(dest + '.tmp')
 
