@@ -74,6 +74,7 @@ REVS_DEFAULT = 5
 VERSION = "0.3"
 
 app = Flask(__name__)
+app.url_map.strict_slashes = False
 
 
 def _git_hash():
@@ -650,14 +651,27 @@ def builders():
     return render_template("builders.html", builders=builders_data, page_title="Builders")
 
 
+PAGE_SIZE = 50
+
 @app.route("/builders/<name>")
 def builder(name):
     db = get_db()
-    builds = db.execute(
-        "SELECT id, number, revision, branch, started, finished, result FROM builds"
-        " WHERE builder = ? ORDER BY number DESC LIMIT 50",
-        (name,),
-    ).fetchall()
+    before = request.args.get("before", type=int)
+    if before:
+        rows = db.execute(
+            "SELECT id, number, revision, branch, started, finished, result FROM builds"
+            " WHERE builder = ? AND number < ? ORDER BY number DESC LIMIT ?",
+            (name, before, PAGE_SIZE + 1),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, number, revision, branch, started, finished, result FROM builds"
+            " WHERE builder = ? ORDER BY number DESC LIMIT ?",
+            (name, PAGE_SIZE + 1),
+        ).fetchall()
+
+    has_older = len(rows) > PAGE_SIZE
+    builds = rows[:PAGE_SIZE]
 
     builds_data = []
     for b in builds:
@@ -673,10 +687,15 @@ def builder(name):
             }
         )
 
+    older_url = f"/builders/{name}?before={builds[-1]['number']}" if has_older and builds else None
+    newer_url = f"/builders/{name}" if before else None
+
     return render_template(
         "builder.html",
         builder=name,
         builds=builds_data,
+        older_url=older_url,
+        newer_url=newer_url,
         page_title=name,
         now=fmt_time(datetime.datetime.now(datetime.timezone.utc).timestamp()),
     )
@@ -691,7 +710,21 @@ def build(name, number):
         (name, number),
     ).fetchone()
     if not b:
-        abort(404)
+        bounds = db.execute(
+            "SELECT MIN(number) AS lo, MAX(number) AS hi FROM builds WHERE builder = ?", (name,)
+        ).fetchone()
+        lo, hi = (bounds["lo"], bounds["hi"]) if bounds else (None, None)
+        if lo is None:
+            msg = f"Builder {name!r} not found."
+        elif number > hi:
+            msg = (f"Build #{number} not found for {name}. "
+                   f"Latest known: <a href='/builders/{name}/builds/{hi}'>#{hi}</a>.")
+        elif number < lo:
+            msg = (f"Build #{number} not found for {name}. "
+                   f"Earliest known: <a href='/builders/{name}/builds/{lo}'>#{lo}</a>.")
+        else:
+            msg = f"Build #{number} is missing from the database for {name}."
+        return f"<p>{msg}</p>", 404
 
     cat_row = db.execute("SELECT category FROM builders WHERE name = ?", (name,)).fetchone()
     category = cat_row["category"] if cat_row else ""

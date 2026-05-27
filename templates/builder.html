@@ -14,4 +14,9 @@
 </tr>
 {% endfor %}
 </table>
+<p>
+{% if newer_url %}<a href="{{ newer_url }}">&larr; newer</a>{% endif %}
+{% if newer_url and older_url %} &nbsp; {% endif %}
+{% if older_url %}<a href="{{ older_url }}">older &rarr;</a>{% endif %}
+</p>
 {% endblock %}
