@@ -303,40 +303,71 @@ def process_build(db, log_root, builder, build_data, skip_logs=False):
     return True
 
 
-def discover_new_builds(builder, last, limit=INITIAL_BACKFILL):
+_DISCOVER_BATCH = 50
+
+
+def discover_new_builds(builder, last, limit=INITIAL_BACKFILL, since_ts=None):
     """
     Walk backward from the latest build using negative indices until we either
-    hit a build number we already have or exhaust the limit.
-    Returns a sorted list of new build numbers to fetch.
+    hit a build number we already have, exhaust the limit, or pass the since_ts
+    cutoff. Returns a sorted list of new build numbers to fetch.
     """
-    selects = "&".join(f"select={-i}" for i in range(1, limit + 1))
-    data = bb_get(f"/json/builders/{builder}/builds?{selects}")
     new = []
-    for build in data.values():
-        number = build.get("number")
-        if number is None or number <= last:
+    offset = 1
+
+    while True:
+        fetch = _DISCOVER_BATCH if since_ts else min(_DISCOVER_BATCH, limit - len(new))
+        if fetch <= 0:
             break
-        new.append(number)
+        selects = "&".join(f"select={-i}" for i in range(offset, offset + fetch))
+        data = bb_get(f"/json/builders/{builder}/builds?{selects}")
+        if not data:
+            break
+
+        builds = sorted(data.values(), key=lambda b: -(b.get("number") or 0))
+        done = False
+        for build in builds:
+            number = build.get("number")
+            if number is None or number <= last:
+                done = True
+                break
+            if since_ts is not None:
+                started = (build.get("times") or [None])[0]
+                if started is not None and started < since_ts:
+                    done = True
+                    break
+            new.append(number)
+
+        if done or len(builds) < fetch:
+            break
+        if not since_ts and len(new) >= limit:
+            break
+        offset += fetch
+
     return sorted(new)
 
 
-def poll_builder(db, log_root, builder, category, skip_logs=False):
+def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None):
     upsert_builder(db, builder, category)
     last = get_last_build(db, builder)
 
-    builds_to_fetch = discover_new_builds(builder, last)
+    # When backfilling by time, ignore the stored watermark so we can fill gaps
+    discover_last = 0 if since_ts else last
+    builds_to_fetch = discover_new_builds(builder, discover_last, since_ts=since_ts)
     if not builds_to_fetch:
         log.debug("%s: nothing new (last=%d)", builder, last)
-        return
+        return 0
 
     log.info("%s: fetching builds %s", builder, builds_to_fetch)
     new_last = last
+    count = 0
     for number in builds_to_fetch:
         try:
             build_data = bb_get(f"/json/builders/{builder}/builds/{number}")
             finished = process_build(db, log_root, builder, build_data, skip_logs=skip_logs)
             if finished:
                 new_last = max(new_last, number)
+                count += 1
         except Exception:
             log.exception("%s #%d failed", builder, number)
 
@@ -344,13 +375,19 @@ def poll_builder(db, log_root, builder, category, skip_logs=False):
         set_last_build(db, builder, new_last)
 
     db.commit()
+    return count
 
 
-def poll_all(db, log_root, skip_logs=False):
+def poll_all(db, log_root, skip_logs=False, since_ts=None):
     builders = bb_get("/json/builders/")
+    stats = {}
     for builder, info in builders.items():
         category = info.get("category", "")
-        poll_builder(db, log_root, builder, category, skip_logs=skip_logs)
+        count = poll_builder(db, log_root, builder, category,
+                             skip_logs=skip_logs, since_ts=since_ts)
+        if count:
+            stats[builder] = count
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +401,9 @@ def main():
     parser.add_argument("--master-root", default="",
                         help="Path to buildbot master directory; if set, skip downloading "
                              "log files (they will be read directly from the master)")
+    parser.add_argument("--days", type=int, default=0,
+                        help="Backfill builds from the past N days (default: last %d per builder)"
+                             % INITIAL_BACKFILL)
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -379,6 +419,8 @@ def main():
         skip_logs = True
         log.info("master-root %s found; skipping log downloads", args.master_root)
 
+    since_ts = time.time() - args.days * 86400 if args.days else None
+
     from sync_util import SyncRun
     os.makedirs(args.log_root, exist_ok=True)
 
@@ -386,10 +428,16 @@ def main():
         db = open_db(args.db)
         start = time.time()
         before = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
-        poll_all(db, args.log_root, skip_logs=skip_logs)
+        stats = poll_all(db, args.log_root, skip_logs=skip_logs, since_ts=since_ts)
         after = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
         run.items_synced = after - before
         log.info("done in %.1fs (%d new finished builds)", time.time() - start, run.items_synced)
+        if stats:
+            col = max(len(b) for b in stats)
+            print(f"\n{'Builder':<{col}}  {'New builds':>10}")
+            print("-" * (col + 13))
+            for builder, count in sorted(stats.items()):
+                print(f"{builder:<{col}}  {count:>10}")
         db.close()
 
 

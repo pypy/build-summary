@@ -67,8 +67,8 @@ def list_branches():
     return [l.rstrip("/") for l in links if l.endswith("/") and not l.startswith((".", "/", "http"))]
 
 
-def download_file(branch, filename, nightly_root, date_str=None, dry_run=False):
-    """Return bytes downloaded, or 0 if already present or dry_run."""
+def download_file(branch, filename, nightly_root, date_str=None, dry_run=False, source_root=None):
+    """Return bytes downloaded (or 1 if linked from source), or 0 if already present."""
     dest = os.path.join(nightly_root, branch, filename)
     if os.path.exists(dest):
         _log = log.info if dry_run else log.debug
@@ -77,6 +77,16 @@ def download_file(branch, filename, nightly_root, date_str=None, dry_run=False):
     if dry_run:
         log.info("would download %s/%s", branch, filename)
         return 0
+
+    # Check source root before hitting the network
+    if source_root:
+        src = os.path.join(source_root, branch, filename)
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.symlink(os.path.abspath(src), dest)
+            log.info("linked from source: %s/%s", branch, filename)
+            return 1  # non-zero signals "processed" to caller
+
     url = f"{BUILDBOT_URL}/nightly/{branch}/{filename}"
     log.info("downloading %s/%s", branch, filename)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -127,7 +137,7 @@ def update_symlinks(branch_dir):
         log.info("symlink %s -> %s", link_name, target)
 
 
-def sync_branch(branch, nightly_root, cutoff, run=None, dry_run=False):
+def sync_branch(branch, nightly_root, cutoff, run=None, dry_run=False, source_root=None):
     dated = list_branch(branch)
     if not dated:
         log.debug("branch %s: no files", branch)
@@ -155,7 +165,8 @@ def sync_branch(branch, nightly_root, cutoff, run=None, dry_run=False):
 
     for rev_key in revisions:
         for filename, date_str in seen_revs[rev_key]:
-            nbytes = download_file(branch, filename, nightly_root, date_str=date_str, dry_run=dry_run)
+            nbytes = download_file(branch, filename, nightly_root, date_str=date_str,
+                                   dry_run=dry_run, source_root=source_root)
             if run and nbytes > 0:
                 run.items_synced += 1
                 run.bytes_fetched += nbytes
@@ -167,6 +178,9 @@ def sync_branch(branch, nightly_root, cutoff, run=None, dry_run=False):
 def main():
     parser = argparse.ArgumentParser(description="Mirror nightly builds from buildbot.pypy.org")
     parser.add_argument("--nightly-root", default=DEFAULT_NIGHTLY_ROOT)
+    parser.add_argument("--source-root", default="",
+                        help="Local directory already containing nightly files (branch subdirs); "
+                             "symlink from here instead of downloading")
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS,
                         help="Mirror files from the last N days (default: %(default)s)")
     parser.add_argument("--branches", help="Comma-separated list of branches (default: all)")
@@ -193,10 +207,12 @@ def main():
         log.info("found branches: %s", branches)
     branches = [b for b in branches if b != 'trunk']
 
+    source_root = args.source_root or None
     with SyncRun("nightly", args.db) as run:
         for branch in branches:
             try:
-                sync_branch(branch, args.nightly_root, cutoff, run, dry_run=args.dry_run)
+                sync_branch(branch, args.nightly_root, cutoff, run,
+                            dry_run=args.dry_run, source_root=source_root)
             except Exception:
                 log.exception("failed syncing branch %s", branch)
 

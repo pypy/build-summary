@@ -36,7 +36,7 @@ def _buildbot_filename(revision):
     return revision + '-64.json'
 
 
-def sync(bench_root, db_path, run=None):
+def sync(bench_root, db_path, source_root=None, run=None):
     os.makedirs(bench_root, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -57,6 +57,17 @@ def sync(bench_root, db_path, run=None):
         if os.path.exists(dest):
             log.debug("already have %s", local_name)
             continue
+
+        # Check source root before hitting the network
+        if source_root:
+            src = os.path.join(source_root, local_name)
+            if os.path.exists(src):
+                os.symlink(os.path.abspath(src), dest)
+                log.info("linked from source: %s", local_name)
+                if run:
+                    run.items_synced += 1
+                continue
+
         bb_name = _buildbot_filename(rev)
         url = f"{BUILDBOT_URL}/benchmark-results/{bb_name}"
         log.debug("checking %s", bb_name)
@@ -81,12 +92,15 @@ def sync(bench_root, db_path, run=None):
             if os.path.exists(dest + '.tmp'):
                 os.unlink(dest + '.tmp')
 
-    log.info("downloaded %d new files", run.items_synced if run else '?')
+    log.info("synced %d new files", run.items_synced if run else '?')
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sync benchmark JSON files from buildbot.pypy.org")
     parser.add_argument("--bench-root", default=DEFAULT_BENCH_ROOT)
+    parser.add_argument("--source-root", default="",
+                        help="Local directory already containing benchmark JSON files; "
+                             "symlink from here instead of downloading")
     parser.add_argument("--db", default=DEFAULT_DB)
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
@@ -97,7 +111,7 @@ def main():
     )
     from sync_util import SyncRun
     with SyncRun("benchmark", args.db) as run:
-        sync(args.bench_root, args.db, run)
+        sync(args.bench_root, args.db, source_root=args.source_root or None, run=run)
 
 
 if __name__ == "__main__":
