@@ -1,6 +1,16 @@
 {% extends "layout.html" %}
 {% block content %}
 <h2>{{ builder }}</h2>
+<form method="get" action="/builders/{{ builder }}" style="margin-bottom:0.75em">
+  <label for="branch-select">Branch:</label>
+  <select id="branch-select" name="branch" onchange="this.form.submit()">
+    <option value="" {% if not current_branch %}selected{% endif %}>— all —</option>
+    {% for b in branches %}
+    <option value="{{ b }}" {% if b == current_branch %}selected{% endif %}>{{ b }}</option>
+    {% endfor %}
+  </select>
+  <noscript><button type="submit">Filter</button></noscript>
+</form>
 <table class="results">
 <tr><th>#</th><th>Revision</th><th>Branch</th><th>Started</th><th>Duration</th><th>Result</th></tr>
 {% for b in builds %}

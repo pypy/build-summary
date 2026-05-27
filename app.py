@@ -622,7 +622,7 @@ def builders():
         r = db.execute(
             """SELECT number, result, finished FROM builds
                WHERE builder = ? AND branch = ?
-               ORDER BY number DESC LIMIT 1""",
+               ORDER BY started DESC LIMIT 1""",
             (builder_name, branch),
         ).fetchone()
         if r is None:
@@ -656,17 +656,50 @@ PAGE_SIZE = 50
 @app.route("/builders/<name>")
 def builder(name):
     db = get_db()
-    before = request.args.get("before", type=int)
-    if before:
+    before = request.args.get("before", type=float)
+    branch = request.args.get("branch", "").strip() or None
+
+    branch_rows = db.execute(
+        "SELECT branch, MAX(started) AS last FROM builds"
+        " WHERE builder = ? AND branch != '' GROUP BY branch",
+        (name,),
+    ).fetchall()
+
+    def _branch_sort_key(row):
+        b, last = row["branch"], row["last"] or 0
+        if b == "main":
+            return (0, 0, b)
+        m = re.match(r"^py3\.(\d+)$", b)
+        if m:
+            return (1, -int(m.group(1)), b)
+        return (2, -last, b)
+
+    branches = [r["branch"] for r in sorted(branch_rows, key=_branch_sort_key)]
+
+    branch_qs = f"&branch={_html.escape(branch)}" if branch else ""
+
+    if before and branch:
         rows = db.execute(
             "SELECT id, number, revision, branch, started, finished, result FROM builds"
-            " WHERE builder = ? AND number < ? ORDER BY number DESC LIMIT ?",
+            " WHERE builder = ? AND branch = ? AND started < ? ORDER BY started DESC LIMIT ?",
+            (name, branch, before, PAGE_SIZE + 1),
+        ).fetchall()
+    elif before:
+        rows = db.execute(
+            "SELECT id, number, revision, branch, started, finished, result FROM builds"
+            " WHERE builder = ? AND started < ? ORDER BY started DESC LIMIT ?",
             (name, before, PAGE_SIZE + 1),
+        ).fetchall()
+    elif branch:
+        rows = db.execute(
+            "SELECT id, number, revision, branch, started, finished, result FROM builds"
+            " WHERE builder = ? AND branch = ? ORDER BY started DESC LIMIT ?",
+            (name, branch, PAGE_SIZE + 1),
         ).fetchall()
     else:
         rows = db.execute(
             "SELECT id, number, revision, branch, started, finished, result FROM builds"
-            " WHERE builder = ? ORDER BY number DESC LIMIT ?",
+            " WHERE builder = ? ORDER BY started DESC LIMIT ?",
             (name, PAGE_SIZE + 1),
         ).fetchall()
 
@@ -687,13 +720,18 @@ def builder(name):
             }
         )
 
-    older_url = f"/builders/{name}?before={builds[-1]['number']}" if has_older and builds else None
-    newer_url = f"/builders/{name}" if before else None
+    older_url = f"/builders/{name}?before={builds[-1]['started']}{branch_qs}" if has_older and builds else None
+    if before:
+        newer_url = f"/builders/{name}?{branch_qs.lstrip('&')}" if branch else f"/builders/{name}"
+    else:
+        newer_url = None
 
     return render_template(
         "builder.html",
         builder=name,
         builds=builds_data,
+        branches=branches,
+        current_branch=branch or "",
         older_url=older_url,
         newer_url=newer_url,
         page_title=name,
