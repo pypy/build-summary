@@ -334,7 +334,9 @@ def render_section_pre(
         bars = " |" * i
         rev_str = rev["revision"]
         display = _display_rev(rev_str)
-        rev_link = f'<a href="{rev["rev_url"]}">{_html.escape(display)}</a>'
+        merge_sha = rev.get("merge_sha")
+        title_attr = f' title="run on merge, merge commit {_html.escape(merge_sha)}"' if merge_sha else ""
+        rev_link = f'<a href="{rev["rev_url"]}"{title_attr}>{_html.escape(display)}</a>'
         padding = " " * (align - 2 * i - 1 - len(display))
         builder_parts = []
         for bshort in sorted(all_builders):
@@ -398,7 +400,7 @@ def render_section_pre(
     return "<nobr><pre>" + "".join(lines) + "</pre></nobr>"
 
 
-def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
+def build_sections(builds, outcomes_by_build, merge_sha_by_bid=None, max_revs=REVS_DEFAULT):
     """
     builds: sqlite3.Row list (id, builder, number, revision, branch, category, started, finished, result, tests_pass)
     outcomes_by_build: {build_id: {test_name: outcome}}
@@ -444,6 +446,7 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
                     "revision": rev,
                     "date": fmt_time(b["started"])[:10] if b["started"] else "",
                     "rev_url": f"/summary?revision={_display_rev(rev)}",
+                    "merge_sha": (merge_sha_by_bid or {}).get(b["id"]),
                 }
 
         revisions = [rev_meta[r] for r in revisions_sorted if r in rev_meta]
@@ -584,7 +587,17 @@ def summary():
 
     outcomes_by_build = {bid: _get_outcomes(bid) for bid in build_ids}
 
-    sections = build_sections(builds, outcomes_by_build, max_revs=max_revs)
+    merge_sha_by_bid = {}
+    if build_ids:
+        placeholders = ",".join("?" * len(build_ids))
+        rows = db.execute(
+            f"SELECT build_id, value FROM properties WHERE name='merge_sha' AND build_id IN ({placeholders})",
+            build_ids,
+        ).fetchall()
+        for row in rows:
+            merge_sha_by_bid[row["build_id"]] = row["value"]
+
+    sections = build_sections(builds, outcomes_by_build, merge_sha_by_bid=merge_sha_by_bid, max_revs=max_revs)
 
     last_build_date = None
     suggested_days = None

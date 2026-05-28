@@ -243,6 +243,7 @@ def process_run(db, log_root, session, repo, run):
 
         # Download each suite artifact; collect raw logs and merged pytestLog text
         sha_from_artifact = sha12
+        merge_sha_from_artifact = None
         merged_parts = []
         suite_logs = []  # [(suite, testrun_text, output_text, s_started, s_finished, s_result)]
         bytes_total = 0
@@ -261,7 +262,12 @@ def process_run(db, log_root, session, repo, run):
                 names = zf.namelist()
                 if "revision.txt" in names:
                     raw = zf.read("revision.txt").decode().strip()
-                    sha_from_artifact = raw.split(":")[-1] if ":" in raw else raw
+                    lines = raw.splitlines()
+                    first = lines[0]
+                    sha_from_artifact = first.split(":")[-1] if ":" in first else first
+                    for extra in lines[1:]:
+                        if extra.startswith("merge_sha:"):
+                            merge_sha_from_artifact = extra.split(":", 1)[1]
                 if "testrun.log" in names:
                     testrun_text = zf.read("testrun.log").decode("utf-8", errors="replace")
                 if "testrun-output.log" in names:
@@ -291,6 +297,14 @@ def process_run(db, log_root, session, repo, run):
             db, builder, run_number, revision, branch,
             started, finished, result, "", "gha",
         )
+
+        if merge_sha_from_artifact:
+            db.execute(
+                """INSERT INTO properties(build_id, name, value, source)
+                   VALUES (?, 'merge_sha', ?, 'gha')
+                   ON CONFLICT(build_id, name) DO UPDATE SET value=excluded.value""",
+                (build_id, merge_sha_from_artifact),
+            )
 
         # One step per suite with its raw logs
         fs_number = f"gha-{run_id}"
