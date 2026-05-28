@@ -161,12 +161,14 @@ def job_timing(jobs, suite, platform):
     """Timing and result for a single suite job."""
     for job in jobs:
         if job.get("name", "") == f"{suite} ({platform})":
+            conclusion = job.get("conclusion") or ""
             return (
                 _parse_ts(job.get("started_at")),
                 _parse_ts(job.get("completed_at")),
-                GHA_RESULT_MAP.get(job.get("conclusion") or "", 4),
+                GHA_RESULT_MAP.get(conclusion, 4),
+                conclusion,
             )
-    return None, None, 2
+    return None, None, 2, ""
 
 
 def platform_timing_and_result(jobs, platform):
@@ -253,7 +255,7 @@ def process_run(db, log_root, session, repo, run):
                 log.warning("  Failed to download %s: %s", art["name"], e)
                 continue
             bytes_total += len(data)
-            s_started, s_finished, s_result = job_timing(jobs, suite, platform)
+            s_started, s_finished, s_result, conclusion = job_timing(jobs, suite, platform)
             testrun_text = output_text = ""
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 names = zf.namelist()
@@ -262,9 +264,22 @@ def process_run(db, log_root, session, repo, run):
                     sha_from_artifact = raw.split(":")[-1] if ":" in raw else raw
                 if "testrun.log" in names:
                     testrun_text = zf.read("testrun.log").decode("utf-8", errors="replace")
-                    merged_parts.append(testrun_text)
                 if "testrun-output.log" in names:
                     output_text = zf.read("testrun-output.log").decode("utf-8", errors="replace")
+            if conclusion in ("cancelled", "timed_out"):
+                last_line = next(
+                    (l.strip() for l in reversed(output_text.splitlines()) if l.strip()),
+                    ""
+                )
+                duration = ""
+                if s_started and s_finished:
+                    mins, secs = divmod(int(s_finished - s_started), 60)
+                    duration = f" (ran {mins}m{secs:02d}s)"
+                detail = f"{conclusion}{duration}"
+                if last_line:
+                    detail += f": {last_line}"
+                testrun_text += f"\n! {suite}/timeout\n {detail}\n"
+            merged_parts.append(testrun_text)
             suite_logs.append((suite, testrun_text, output_text, s_started, s_finished, s_result))
 
         if not merged_parts:
@@ -354,11 +369,14 @@ def sync(db, log_root, session, repo, workflow_file):
 
 def main():
     parser = argparse.ArgumentParser(description="Sync GHA artifacts into SQLite")
-    parser.add_argument("--repo", default=DEFAULT_REPO)
+    parser.add_argument("--repo", default=DEFAULT_REPO,
+                        help="GitHub repo (default: %(default)s)")
     parser.add_argument("--workflow-file", default=DEFAULT_WORKFLOW_FILE,
-                        help="Workflow filename, e.g. rpython-unit-tests.yml")
-    parser.add_argument("--db", default=DEFAULT_DB)
-    parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT)
+                        help="Workflow filename (default: %(default)s)")
+    parser.add_argument("--db", default=DEFAULT_DB,
+                        help="SQLite database path (default: %(default)s)")
+    parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT,
+                        help="Directory for log files (default: %(default)s)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 

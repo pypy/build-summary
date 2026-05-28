@@ -177,14 +177,16 @@ def sync_branch(branch, nightly_root, cutoff, run=None, dry_run=False, source_ro
 
 def main():
     parser = argparse.ArgumentParser(description="Mirror nightly builds from buildbot.pypy.org")
-    parser.add_argument("--nightly-root", default=DEFAULT_NIGHTLY_ROOT)
+    parser.add_argument("--nightly-root", default=DEFAULT_NIGHTLY_ROOT,
+                        help="Directory for nightly build files (default: %(default)s)")
     parser.add_argument("--source-root", default="",
                         help="Local directory already containing nightly files (branch subdirs); "
                              "symlink from here instead of downloading")
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS,
                         help="Mirror files from the last N days (default: %(default)s)")
     parser.add_argument("--branches", help="Comma-separated list of branches (default: all)")
-    parser.add_argument("--db", default="pypy_summary.sqlite")
+    parser.add_argument("--db", default="pypy_summary.sqlite",
+                        help="SQLite database path (default: %(default)s)")
     parser.add_argument("--dry-run", "-n", action="store_true",
                         help="Report what would be downloaded without downloading")
     parser.add_argument("--verbose", "-v", action="store_true")

@@ -23,6 +23,7 @@
 {% endblock %}
 
 {% block content %}
+{% if revision %}<p>Showing results for revision <b><a href="/revision/{{ revision }}">{{ revision }}</a></b>.</p>{% endif %}
 {% if sections %}
 {% for section in sections %}
 <h2>

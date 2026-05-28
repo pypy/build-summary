@@ -396,14 +396,16 @@ def poll_all(db, log_root, skip_logs=False, since_ts=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Poll buildbot.pypy.org into SQLite")
-    parser.add_argument("--db", default=DEFAULT_DB)
-    parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT)
+    parser.add_argument("--db", default=DEFAULT_DB,
+                        help="SQLite database path (default: %(default)s)")
+    parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT,
+                        help="Directory for log files (default: %(default)s)")
     parser.add_argument("--master-root", default="",
                         help="Path to buildbot master directory; if set, skip downloading "
                              "log files (they will be read directly from the master)")
     parser.add_argument("--days", type=int, default=0,
-                        help="Backfill builds from the past N days (default: last %d per builder)"
-                             % INITIAL_BACKFILL)
+                        help="Backfill builds from the past N days "
+                             "(default: last %d per builder)" % INITIAL_BACKFILL)
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 

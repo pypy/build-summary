@@ -126,11 +126,13 @@ def sync(bench_root, db_path, source_root=None, run=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Sync benchmark JSON files from buildbot.pypy.org")
-    parser.add_argument("--bench-root", default=DEFAULT_BENCH_ROOT)
+    parser.add_argument("--bench-root", default=DEFAULT_BENCH_ROOT,
+                        help="Directory for benchmark result files (default: %(default)s)")
     parser.add_argument("--source-root", default="",
                         help="Local directory already containing benchmark JSON files; "
                              "symlink from here instead of downloading")
-    parser.add_argument("--db", default=DEFAULT_DB)
+    parser.add_argument("--db", default=DEFAULT_DB,
+                        help="SQLite database path (default: %(default)s)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 

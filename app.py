@@ -1,3 +1,4 @@
+import argparse
 import bz2
 import datetime
 import functools
@@ -267,7 +268,7 @@ def _pytestlog_paths(build_id):
     return paths
 
 
-_OUTCOME_PRIORITY = {"!": 3, "F": 2, "X": 1, "x": 1, "s": 1, ".": 0, " ": -1}
+_OUTCOME_PRIORITY = {"!": 3, "F": 2, "E": 2, "X": 1, "x": 1, "s": 1, ".": 0, " ": -1}
 
 
 @functools.lru_cache(maxsize=1024)
@@ -289,7 +290,7 @@ def _get_outcomes(build_id):
 def _outcome_counts(outcomes, tests_pass=None):
     nF = ns = nx = ndot = 0
     for o in outcomes.values():
-        if o in ("F", "!"):
+        if o in ("F", "!", "E"):
             nF += 1
         elif o == "s":
             ns += 1
@@ -383,7 +384,7 @@ def render_section_pre(
                 if bid
                 else " "
             )
-            if outcome in ("F", "!"):
+            if outcome in ("F", "!", "E"):
                 tenc = urllib.parse.quote(row["test_name"], safe="")
                 cells.append(
                     f' <a class="failSummary failed" href="/longrepr/{bid}/{tenc}">{outcome}</a>'
@@ -442,7 +443,7 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
                 rev_meta[rev] = {
                     "revision": rev,
                     "date": fmt_time(b["started"])[:10] if b["started"] else "",
-                    "rev_url": f"/revision/{_display_rev(rev)}?category={category}",
+                    "rev_url": f"/summary?revision={_display_rev(rev)}",
                 }
 
         revisions = [rev_meta[r] for r in revisions_sorted if r in rev_meta]
@@ -468,7 +469,7 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
             if bshort is None:
                 continue
             for tname, outcome in outcomes_by_build.get(bid, {}).items():
-                if outcome in ("F", "!"):
+                if outcome in ("F", "!", "E"):
                     key = (bshort, tname)
                     if error_keys.get(key) != "!":
                         error_keys[key] = outcome
@@ -482,7 +483,7 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT):
                 bid = builds_by_rev_builder.get(rev["revision"], {}).get(bshort)
                 if bid:
                     outcome = _lookup_outcome(outcomes_by_build.get(bid, {}), tname)
-                    if outcome in ("F", "!"):
+                    if outcome in ("F", "!", "E"):
                         combination |= 1 << i
             matrix_rows.append(
                 {
@@ -546,19 +547,27 @@ def summary():
     db = get_db()
     category = request.args.get("category")
     branch = request.args.get("branch")
+    revision = request.args.get("revision")
     days = int(request.args.get("days", DAYS_DEFAULT))
     max_revs = int(request.args.get("maxrev", REVS_DEFAULT))
-    cutoff = datetime.datetime.now(datetime.timezone.utc).timestamp() - days * 86400
 
     query = """
         SELECT b.id, b.builder, b.number, b.revision, b.branch,
                b.started, b.finished, b.result, b.tests_pass, bl.category
         FROM builds b
         JOIN builders bl ON b.builder = bl.name
-        WHERE b.finished > ? AND b.finished IS NOT NULL
+        WHERE b.finished IS NOT NULL
     """
     prefix = request.args.get("prefix")
-    params = [cutoff]
+    params = []
+    if revision:
+        query += " AND b.revision LIKE ?"
+        params.append("%" + revision + "%")
+        max_revs = 1
+    else:
+        cutoff = datetime.datetime.now(datetime.timezone.utc).timestamp() - days * 86400
+        query += " AND b.finished > ?"
+        params.append(cutoff)
     if category:
         query += " AND bl.category = ?"
         params.append(category)
@@ -579,7 +588,7 @@ def summary():
 
     last_build_date = None
     suggested_days = None
-    if not sections:
+    if not sections and not revision:
         max_query = """
             SELECT MAX(b.finished) AS ts
             FROM builds b
@@ -608,6 +617,7 @@ def summary():
         last_build_date=last_build_date,
         suggested_days=suggested_days,
         days=days,
+        revision=revision,
         page_title="PyPy Build Summary",
         now=fmt_time(datetime.datetime.now(datetime.timezone.utc).timestamp()),
     )
@@ -1287,4 +1297,26 @@ def static_files(filename):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+    parser = argparse.ArgumentParser(description="PyPy build summary web app")
+    parser.add_argument("--db", default=DB_PATH,
+                        help="SQLite database path (default: %(default)s)")
+    parser.add_argument("--log-root", default=LOG_ROOT,
+                        help="Log file directory (default: %(default)s)")
+    parser.add_argument("--buildbot-master-root", default=BUILDBOT_MASTER_ROOT,
+                        help="Buildbot master directory (default: %(default)s)")
+    parser.add_argument("--nightly-root", default=NIGHTLY_ROOT,
+                        help="Nightly build directory (default: %(default)s)")
+    parser.add_argument("--bench-root", default=BENCH_ROOT,
+                        help="Benchmark results directory (default: %(default)s)")
+    parser.add_argument("--port", type=int, default=5001,
+                        help="Port to listen on (default: %(default)s)")
+    parser.add_argument("--debug", action="store_true", default=True)
+    args = parser.parse_args()
+
+    DB_PATH = args.db
+    LOG_ROOT = args.log_root
+    BUILDBOT_MASTER_ROOT = args.buildbot_master_root
+    NIGHTLY_ROOT = args.nightly_root
+    BENCH_ROOT = args.bench_root
+
+    app.run(debug=args.debug, port=args.port)
