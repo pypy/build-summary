@@ -903,12 +903,11 @@ def longrepr(build_id, test_name):
 
     builder = _h.escape(build["builder"])
     number = build["number"]
-    rerun = test_name.replace(".", "/").replace("::", "/")
     title = _h.escape(test_name)
     body = f"""<h2><b>{title}</b></h2>
 <pre>{_h.escape(longrepr_text)}</pre>
 <pre style="border-top:1px solid"><a href="/builders/{builder}/builds/{number}">builder: {builder} build #{number}</a></pre>
-<pre>test: {_h.escape(rerun)}</pre>"""
+<pre>test: {_h.escape(test_name)}</pre>"""
     return render_template("longrepr.html", page_title=test_name, body=body)
 
 
