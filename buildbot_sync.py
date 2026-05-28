@@ -149,21 +149,25 @@ def parse_pytest_log(text):
     name = None
     longrepr_lines = []
 
+    def _flush(name, kind, lines):
+        if kind == 'F' and '::' not in name:
+            kind = '!'
+        return (name, kind, '\n'.join(lines) or None)
+
     for line in text.splitlines():
         if not line:
             continue
         if line[0] == ' ':
             longrepr_lines.append(line[1:])
             continue
-        # flush previous
         if kind is not None:
-            yield (name, kind, '\n'.join(longrepr_lines) or None)
+            yield _flush(name, kind, longrepr_lines)
         kind = line[0]
         name = line[2:].rstrip()
         longrepr_lines = []
 
     if kind is not None:
-        yield (name, kind, '\n'.join(longrepr_lines) or None)
+        yield _flush(name, kind, longrepr_lines)
 
 
 def parse_xml_log(text):

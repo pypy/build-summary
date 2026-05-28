@@ -14,7 +14,7 @@
   {% for b in builds %}
   <tr class="{{ b.css }}">
     <td><a href="/builders/{{ b.builder }}">{{ b.builder }}</a></td>
-    <td>{{ b.branch }}</td>
+    <td>{% if b.branch %}<a href="/branch/{{ b.branch }}">{{ b.branch }}</a>{% endif %}</td>
     <td><a href="/builders/{{ b.builder }}/builds/{{ b.number }}">#{{ b.number }}</a></td>
     <td>{{ b.started_fmt }}</td>
     <td>{{ b.duration }}</td>

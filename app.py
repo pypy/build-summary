@@ -387,7 +387,7 @@ def render_section_pre(
                 else " "
             )
             if outcome in ("F", "!", "E"):
-                tenc = urllib.parse.quote(row["test_name"], safe="")
+                tenc = urllib.parse.quote(row["test_name"], safe="/")
                 cells.append(
                     f' <a class="failSummary failed" href="/longrepr/{bid}/{tenc}">{outcome}</a>'
                 )
@@ -878,17 +878,24 @@ def longrepr(build_id, test_name):
         abort(404)
 
     longrepr_text = None
+    prefix = test_name + "::"
     for path in _pytestlog_paths(build_id):
         try:
             text = read_log_file(path)
         except OSError:
             continue
         parser = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
+        prefix_repr = None
         for name, outcome, repr_text in parser(text):
             if name == test_name and repr_text:
                 longrepr_text = repr_text
                 break
+            if prefix_repr is None and name.startswith(prefix) and repr_text:
+                prefix_repr = repr_text
         if longrepr_text:
+            break
+        if prefix_repr:
+            longrepr_text = prefix_repr
             break
 
     if not longrepr_text:
@@ -903,6 +910,54 @@ def longrepr(build_id, test_name):
 <pre style="border-top:1px solid"><a href="/builders/{builder}/builds/{number}">builder: {builder} build #{number}</a></pre>
 <pre>test: {_h.escape(rerun)}</pre>"""
     return render_template("longrepr.html", page_title=test_name, body=body)
+
+
+@app.route("/branch/<name>")
+def branch(name):
+    db = get_db()
+    before = request.args.get("before", type=float)
+
+    if before:
+        rows = db.execute(
+            "SELECT id, builder, number, revision, started, finished, result FROM builds"
+            " WHERE branch = ? AND started < ? ORDER BY started DESC LIMIT ?",
+            (name, before, PAGE_SIZE + 1),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, builder, number, revision, started, finished, result FROM builds"
+            " WHERE branch = ? ORDER BY started DESC LIMIT ?",
+            (name, PAGE_SIZE + 1),
+        ).fetchall()
+
+    has_older = len(rows) > PAGE_SIZE
+    builds = rows[:PAGE_SIZE]
+
+    builds_data = []
+    for b in builds:
+        raw_rev = b["revision"] or ""
+        display_rev = _display_rev(raw_rev)
+        builds_data.append({
+            "builder": b["builder"],
+            "number": b["number"],
+            "revision": display_rev,
+            "rev_url": f"/revision/{display_rev}" if display_rev else "",
+            "started_fmt": fmt_time(b["started"]),
+            "result_text": RESULT_TEXT.get(b["result"], "running" if b["finished"] is None else "—"),
+            "css": RESULT_CSS.get(b["result"], "running" if b["finished"] is None else ""),
+        })
+
+    older_url = f"/branch/{name}?before={builds[-1]['started']}" if has_older and builds else None
+    newer_url = f"/branch/{name}" if before else None
+
+    return render_template(
+        "branch.html",
+        branch=name,
+        builds=builds_data,
+        older_url=older_url,
+        newer_url=newer_url,
+        page_title=f"branch: {name}",
+    )
 
 
 @app.route("/revision/<sha>")
