@@ -20,8 +20,6 @@ import zipfile
 import requests
 
 from buildbot_sync import (
-    DEFAULT_DB,
-    DEFAULT_LOG_ROOT,
     get_last_build,
     insert_build,
     insert_log,
@@ -31,7 +29,7 @@ from buildbot_sync import (
     set_last_build,
     upsert_builder,
 )
-from sync_util import SyncRun
+from sync_util import DB_PATH, LOG_ROOT, SyncRun
 
 GITHUB_API = "https://api.github.com"
 REQUEST_TIMEOUT = 30
@@ -395,9 +393,9 @@ def main():
                         help="GitHub repo (default: %(default)s)")
     parser.add_argument("--workflow-file", default=DEFAULT_WORKFLOW_FILE,
                         help="Workflow filename (default: %(default)s)")
-    parser.add_argument("--db", default=DEFAULT_DB,
+    parser.add_argument("--db", default=DB_PATH,
                         help="SQLite database path (default: %(default)s)")
-    parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT,
+    parser.add_argument("--log-root", default=LOG_ROOT,
                         help="Directory for log files (default: %(default)s)")
     parser.add_argument("--days", type=int, default=0,
                         help="Backfill runs from the past N days (default: resume from last seen run)")

@@ -65,9 +65,7 @@ from flask import (
     send_from_directory,
 )
 
-DB_PATH = os.environ.get("SUMMARY_DB", "pypy_summary.sqlite")
-LOG_ROOT = os.environ.get("LOG_ROOT", "logs")
-BUILDBOT_MASTER_ROOT = os.environ.get("BUILDBOT_MASTER_ROOT", "~/buildbot/master")
+from sync_util import DB_PATH, LOG_ROOT, BUILDBOT_MASTER_ROOT
 NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "~/nightly")
 BENCH_ROOT = os.environ.get("BENCH_ROOT", "~/benchmark-results")
 BUILDBOT_URL = "https://buildbot.pypy.org"

@@ -15,10 +15,11 @@ import urllib.parse
 
 import requests
 
+from sync_util import DB_PATH
+
 BUILDBOT_URL = "https://buildbot.pypy.org"
 BENCHMARK_CATEGORY = "benchmark-run"
 DEFAULT_BENCH_ROOT = "benchmark-results"
-DEFAULT_DB = "pypy_summary.sqlite"
 REQUEST_TIMEOUT = 60
 
 log = logging.getLogger(__name__)
@@ -139,7 +140,7 @@ def main():
     parser.add_argument("--source-root", default="",
                         help="Local directory already containing benchmark JSON files; "
                              "symlink from here instead of downloading")
-    parser.add_argument("--db", default=DEFAULT_DB,
+    parser.add_argument("--db", default=DB_PATH,
                         help="SQLite database path (default: %(default)s)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()

@@ -21,9 +21,9 @@ except ImportError:
     import zstandard as _zstd
     def _zstd_compress(data): return _zstd.ZstdCompressor().compress(data)
 
+from sync_util import DB_PATH, LOG_ROOT, SyncRun
+
 BUILDBOT_URL = "https://buildbot.pypy.org"
-DEFAULT_DB = "pypy_summary.sqlite"
-DEFAULT_LOG_ROOT = "logs"
 REQUEST_TIMEOUT = 30
 # How many past builds to check per builder on first run
 INITIAL_BACKFILL = 15
@@ -400,9 +400,9 @@ def poll_all(db, log_root, skip_logs=False, since_ts=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Poll buildbot.pypy.org into SQLite")
-    parser.add_argument("--db", default=DEFAULT_DB,
+    parser.add_argument("--db", default=DB_PATH,
                         help="SQLite database path (default: %(default)s)")
-    parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT,
+    parser.add_argument("--log-root", default=LOG_ROOT,
                         help="Directory for log files (default: %(default)s)")
     parser.add_argument("--master-root", default="",
                         help="Path to buildbot master directory; if set, skip downloading "
@@ -427,7 +427,6 @@ def main():
 
     since_ts = time.time() - args.days * 86400 if args.days else None
 
-    from sync_util import SyncRun
     os.makedirs(args.log_root, exist_ok=True)
 
     with SyncRun("buildbot", args.db) as run:

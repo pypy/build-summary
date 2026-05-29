@@ -11,10 +11,15 @@ Usage in a sync script:
 
 import io
 import logging
+import os
 import sqlite3
 import sys
 import time
 import traceback
+
+DB_PATH = os.environ.get("SUMMARY_DB", "pypy_summary.sqlite")
+LOG_ROOT = os.environ.get("LOG_ROOT", "logs")
+BUILDBOT_MASTER_ROOT = os.environ.get("BUILDBOT_MASTER_ROOT", "~/buildbot/master")
 
 OUTPUT_LIMIT = 64 * 1024  # truncate captured log at 64 KB
 

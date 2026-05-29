@@ -12,10 +12,8 @@ import logging
 import os
 import sqlite3
 
-from buildbot_sync import (
-    DEFAULT_DB, DEFAULT_LOG_ROOT,
-    fetch_log_text, save_pytest_log, insert_log,
-)
+from buildbot_sync import fetch_log_text, save_pytest_log, insert_log
+from sync_util import DB_PATH, LOG_ROOT
 
 log = logging.getLogger(__name__)
 
@@ -60,8 +58,8 @@ def backfill(db_path, log_root):
 
 def main():
     parser = argparse.ArgumentParser(description="Backfill missing pytestLog files")
-    parser.add_argument("--db", default=DEFAULT_DB)
-    parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT)
+    parser.add_argument("--db", default=DB_PATH)
+    parser.add_argument("--log-root", default=LOG_ROOT)
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
