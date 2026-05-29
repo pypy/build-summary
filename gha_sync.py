@@ -133,14 +133,24 @@ def fetch_artifacts(session, repo, run_id):
     return data.get("artifacts", [])
 
 
-def download_zip(session, artifact_id, repo):
-    r = session.get(
-        f"{GITHUB_API}/repos/{repo}/actions/artifacts/{artifact_id}/zip",
-        timeout=DOWNLOAD_TIMEOUT,
-        allow_redirects=True,
-    )
-    r.raise_for_status()
-    return r.content
+def download_zip(session, artifact_id, repo, retries=4):
+    url = f"{GITHUB_API}/repos/{repo}/actions/artifacts/{artifact_id}/zip"
+    for attempt in range(retries + 1):
+        r = session.get(url, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+        if r.status_code in (403, 429) and attempt < retries:
+            wait = int(r.headers.get("Retry-After", 0))
+            if not wait:
+                reset = r.headers.get("X-RateLimit-Reset")
+                if reset:
+                    wait = max(0, int(reset) - int(time.time()))
+            wait = wait or (60 * (attempt + 1))
+            log.warning("  Rate limited on artifact %d; waiting %ds (attempt %d/%d)",
+                        artifact_id, wait, attempt + 1, retries)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.content
+    r.raise_for_status()  # should not be reached
 
 
 # ---------------------------------------------------------------------------
