@@ -97,6 +97,18 @@ def _parse_ts(s):
 
 def _gh_get(session, url, **params):
     r = session.get(url, params=params or None, timeout=REQUEST_TIMEOUT)
+    if r.status_code in (403, 429):
+        reset_ts = r.headers.get("x-ratelimit-reset")
+        retry_after = r.headers.get("retry-after")
+        if retry_after:
+            wait = int(retry_after)
+        elif reset_ts:
+            wait = max(0, int(reset_ts) - int(time.time())) + 1
+        else:
+            wait = 60
+        log.warning("Rate limited by GitHub; sleeping %ds before retry", wait)
+        time.sleep(wait)
+        r = session.get(url, params=params or None, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
