@@ -1,6 +1,6 @@
 """
 Download benchmark result JSON files from buildbot.pypy.org.
-Uses the local DB to know which revisions to fetch (from jit-benchmark-linux-x86-64 builds).
+Uses the local DB to know which revisions to fetch (from builders in the benchmark-run category).
 
 Usage:
     python benchmark_sync.py [--bench-root path] [--db path] [--verbose]
@@ -11,19 +11,20 @@ import logging
 import os
 import re
 import sqlite3
+import urllib.parse
 
 import requests
 
 BUILDBOT_URL = "https://buildbot.pypy.org"
-BUILDER_NAME = "jit-benchmark-linux-x86-64"
+BENCHMARK_CATEGORY = "benchmark-run"
 DEFAULT_BENCH_ROOT = "benchmark-results"
 DEFAULT_DB = "pypy_summary.sqlite"
 REQUEST_TIMEOUT = 60
 
 log = logging.getLogger(__name__)
 
-# DB revision format: "REVNUM:HASH"
-_REV_RE = re.compile(r'^(\d+):([0-9a-f]+)$')
+# DB revision format: "REVNUM:HASH" or just "HASH"
+_REV_RE = re.compile(r'^(?:\d+:)?([0-9a-f]+)$')
 
 # Filename format: {revnum}{sep}{hash}-64[-{machine}].json
 # sep can be : (original), - or _ (future-safe replacements)
@@ -45,35 +46,42 @@ def list_remote_files():
     """Return list of benchmark JSON filenames from the buildbot index."""
     r = requests.get(f"{BUILDBOT_URL}/benchmark-results/", timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-    return [f for f in re.findall(r'href="([^"?#/][^"]*\.json)"', r.text)
-            if _FILE_RE.match(f)]
+    files = [urllib.parse.unquote(f)
+             for f in re.findall(r'href="([^"?#/][^"]*\.json)"', r.text)]
+    return [f for f in files if _FILE_RE.match(f)]
 
 
 def sync(bench_root, db_path, source_root=None, run=None):
     os.makedirs(bench_root, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    builders = [r['name'] for r in conn.execute(
+        "SELECT name FROM builders WHERE category = ?", (BENCHMARK_CATEGORY,)
+    ).fetchall()]
+    if not builders:
+        log.warning("no builders found in category %r", BENCHMARK_CATEGORY)
     rows = conn.execute(
         """SELECT DISTINCT revision FROM builds
-           WHERE builder = ? AND revision IS NOT NULL AND revision != ''
-           ORDER BY started DESC""",
-        (BUILDER_NAME,),
-    ).fetchall()
+           WHERE builder IN ({}) AND revision IS NOT NULL AND revision != ''""".format(
+            ','.join('?' * len(builders))
+        ),
+        builders,
+    ).fetchall() if builders else []
     conn.close()
 
-    known = set()
+    known_hashes = set()
     for r in rows:
         m = _REV_RE.match(r['revision'])
         if m:
-            known.add((int(m.group(1)), m.group(2)))
-    log.info("found %d revisions for %s", len(known), BUILDER_NAME)
+            known_hashes.add(m.group(1)[:12])
+    log.info("found %d distinct hashes across %s", len(known_hashes), builders)
 
     log.info("listing remote benchmark-results/")
     remote_files = list_remote_files()
     log.info("found %d remote JSON files", len(remote_files))
 
-    to_fetch = [f for f in remote_files if _parse_filename(f) in known]
-    log.info("%d files match known revisions", len(to_fetch))
+    to_fetch = [f for f in remote_files if (_parse_filename(f) or (None, None))[1] in known_hashes]
+    log.info("%d files match known hashes", len(to_fetch))
 
     for filename in to_fetch:
         local_name = _normalize_filename(filename)

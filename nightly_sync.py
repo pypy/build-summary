@@ -11,6 +11,7 @@ import datetime
 import logging
 import os
 import re
+import sqlite3
 import requests
 
 BUILDBOT_URL = "https://buildbot.pypy.org"
@@ -55,6 +56,23 @@ def revision_key(filename):
 
 def _cutoff_date(days):
     return (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+
+
+def active_branches_from_db(db_path, days=30):
+    """Return branches that have had builds in the last N days, or None on error."""
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).timestamp()
+    try:
+        db = sqlite3.connect(db_path)
+        rows = db.execute(
+            "SELECT DISTINCT branch FROM builds"
+            " WHERE started > ? AND branch IS NOT NULL AND branch != ''",
+            (cutoff,),
+        ).fetchall()
+        db.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.warning("could not read branches from db: %s", e)
+        return None
 
 
 def list_branches():
@@ -205,8 +223,12 @@ def main():
     if args.branches:
         branches = [b.strip() for b in args.branches.split(",")]
     else:
-        branches = list_branches()
-        log.info("found branches: %s", branches)
+        branches = active_branches_from_db(args.db, days=30)
+        if branches is not None:
+            log.info("branches from db: %s", branches)
+        else:
+            branches = list_branches()
+            log.info("branches from remote: %s", branches)
     branches = [b for b in branches if b != 'trunk']
 
     source_root = args.source_root or None

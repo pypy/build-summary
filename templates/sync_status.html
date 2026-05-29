@@ -2,6 +2,16 @@
 {% block content %}
 <h2>Sync Status</h2>
 
+{% if last_checked %}
+<p style="margin-bottom:0.5em">
+<table>
+<tr><th> script </th><th> last checked </th></tr>
+{% for script, ts in last_checked.items() %}
+  <tr><td> {{ script }} </td><td> {{ ts }} </td></tr>
+{% endfor %}
+</td>
+{% endif %}
+
 {% if runs %}
 <table class="info">
 <tr>
@@ -28,4 +38,9 @@
 {% else %}
 <p>No sync runs recorded yet.</p>
 {% endif %}
+<p>
+{% if newer_url %}<a href="{{ newer_url }}">&larr; newer</a>{% endif %}
+{% if newer_url and older_url %} &nbsp; {% endif %}
+{% if older_url %}<a href="{{ older_url }}">older &rarr;</a>{% endif %}
+</p>
 {% endblock %}

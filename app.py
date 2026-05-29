@@ -16,6 +16,7 @@ import urllib.request
 from importlib.metadata import version as pkg_version
 
 from buildbot_sync import parse_pytest_log, parse_xml_log
+from sync_util import get_last_checked
 
 try:
     from compression.zstd import decompress as _zstd_decompress
@@ -101,7 +102,7 @@ VERSION_INFO = {
     "git_hash": _git_hash(),
     "flask": pkg_version("flask"),
     "jinja2": pkg_version("jinja2"),
-    "python": sys.version,
+    "python": sys.version.split()[0],
     "platform": sys.platform,
 }
 
@@ -568,13 +569,34 @@ def index():
     return render_template("index.html", page_title="PyPy Buildbot", now=_now())
 
 
+_INTERNAL_ENDPOINTS = {"static_files", "serve_log", "serve_nightly_file", "serve_benchmark_file", "sync_log"}
+
 @app.route("/about")
 def about():
-    return render_template("about.html", page_title="About", now=_now(), **VERSION_INFO)
+    endpoints = []
+    for rule in sorted(app.url_map.iter_rules(), key=lambda r: r.rule):
+        fn = app.view_functions.get(rule.endpoint)
+        if fn is None or rule.endpoint in _INTERNAL_ENDPOINTS:
+            continue
+        doc = (fn.__doc__ or "").strip()
+        if not doc:
+            continue
+        lines = doc.splitlines()
+        summary = lines[0]
+        params = [l.strip() for l in lines[1:] if l.strip()]
+        endpoints.append({"path": rule.rule, "summary": summary, "params": params})
+    return render_template("about.html", page_title="About", now=_now(), endpoints=endpoints, **VERSION_INFO)
 
 
 @app.route("/summary")
 def summary():
+    """Build summary matrix.
+    ?branch=NAME           — filter to one branch
+    ?revision=SHA          — show a specific revision; repeat to compare two
+    ?category=CAT          — filter to one platform category, e.g. ?category=linux64
+    ?prefix=STR            — filter builders whose name starts with STR, e.g. ?prefix=rpython
+    ?days=N                — how many days back to show (default 14)
+    ?maxrev=N              — max revisions per section (default 5)"""
     db = get_db()
     category = request.args.get("category")
     branch = request.args.get("branch")
@@ -663,6 +685,7 @@ def summary():
 
 @app.route("/builders")
 def builders():
+    """List of all known builders with their latest results on main and py3.11."""
     db = get_db()
     rows = db.execute("SELECT name, category FROM builders ORDER BY name").fetchall()
 
@@ -703,6 +726,8 @@ PAGE_SIZE = 50
 
 @app.route("/builders/<name>")
 def builder(name):
+    """Paginated build history for one builder.
+    ?branch=NAME  — filter to one branch"""
     db = get_db()
     before = request.args.get("before", type=float)
     branch = request.args.get("branch", "").strip() or None
@@ -789,6 +814,7 @@ def builder(name):
 
 @app.route("/builders/<name>/builds/<int:number>")
 def build(name, number):
+    """Detail page for a single build: steps, logs, test outcomes."""
     db = get_db()
     b = db.execute(
         "SELECT id, revision, branch, started, finished, result, slave, reason FROM builds"
@@ -893,6 +919,7 @@ def build(name, number):
 
 @app.route("/longrepr/<int:build_id>/<path:test_name>")
 def longrepr(build_id, test_name):
+    """Full failure output for one test in a build. Links are generated automatically from the summary matrix."""
     import html as _h
 
     db = get_db()
@@ -938,6 +965,7 @@ def longrepr(build_id, test_name):
 
 @app.route("/branch/<name>")
 def branch(name):
+    """Paginated build history for all builders on one branch, with a comparison shortcut."""
     db = get_db()
     before = request.args.get("before", type=float)
 
@@ -989,6 +1017,9 @@ def branch(name):
 
 @app.route("/compare-branch")
 def compare_branch():
+    """Redirect to a two-revision comparison summary for a feature branch vs a primary branch.
+    ?branch=NAME  — the feature branch
+    ?base=NAME    — the primary branch to compare against (e.g. main, py3.11)"""
     db = get_db()
     branch_a = request.args.get("branch", "")
     branch_b = request.args.get("base", "")
@@ -1029,6 +1060,8 @@ def compare_branch():
 
 @app.route("/revision/<sha>")
 def revision(sha):
+    """All builds for a given revision SHA (prefix match).
+    ?category=CAT  — filter to one platform category, e.g. ?category=linux64"""
     db = get_db()
     category = request.args.get("category")
     query = """SELECT b.id, b.builder, b.number, b.branch, b.started, b.finished,
@@ -1325,7 +1358,13 @@ def serve_nightly_file(branch, filename):
     return redirect(f"{BUILDBOT_URL}/nightly/{branch}/{filename}", code=302)
 
 
-_BENCH_FILE_RE = re.compile(r'^(\d+)-([0-9a-f]+)-64\.json$')
+_BENCH_FILE_RE = re.compile(r'^(\d+)-([0-9a-f]+)-64(-[^.]+)?\.json$')
+
+# Machine name (from filename suffix, or "benchmarker" when absent) → builder name.
+_MACHINE_TO_BUILDER = {
+    "benchmarker":  "jit-benchmark-linux-x86-64",
+    "benchmarker2": "jit-benchmark2-linux-x86-64",
+}
 
 
 def _bench_files():
@@ -1339,7 +1378,9 @@ def _bench_files():
         if not m:
             continue
         revnum, rev_hash = int(m.group(1)), m.group(2)
+        machine = m.group(3)[1:] if m.group(3) else "benchmarker"
         revision = f"{revnum}:{rev_hash}"
+        builder = _MACHINE_TO_BUILDER.get(machine, _MACHINE_TO_BUILDER["benchmarker"])
         fpath = os.path.join(BENCH_ROOT, fname)
         try:
             st = os.stat(fpath)
@@ -1359,19 +1400,20 @@ def _bench_files():
             pass
         row = db.execute(
             "SELECT number FROM builds WHERE builder = ? AND revision = ? LIMIT 1",
-            ("jit-benchmark-linux-x86-64", revision),
+            (builder, revision),
         ).fetchone()
-        build_number = row['number'] if row else None
         files.append({
             'filename': fname,
             'revnum': revnum,
             'revision': revision,
             'branch': branch,
-            'build_number': build_number,
+            'machine': machine,
+            'builder': builder,
+            'build_number': row['number'] if row else None,
             'size': size,
             'date': date,
         })
-    files.sort(key=lambda f: -f['revnum'])
+    files.sort(key=lambda f: (f['date'] or '', -f['revnum'], f['machine']), reverse=True)
     return files
 
 
@@ -1393,13 +1435,27 @@ def serve_benchmark_file(filename):
 
 @app.route("/sync-status")
 def sync_status():
+    """Recent sync script runs and their status."""
     db = get_db()
-    runs = db.execute(
-        """SELECT id, script, started, finished, status, items_synced, bytes_fetched
-           FROM sync_runs ORDER BY started DESC LIMIT 60"""
-    ).fetchall()
+    before = request.args.get("before", type=float)
+    if before:
+        rows = db.execute(
+            """SELECT id, script, started, finished, status, items_synced, bytes_fetched
+               FROM sync_runs WHERE started < ? ORDER BY started DESC LIMIT ?""",
+            (before, PAGE_SIZE + 1),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT id, script, started, finished, status, items_synced, bytes_fetched
+               FROM sync_runs ORDER BY started DESC LIMIT ?""",
+            (PAGE_SIZE + 1,),
+        ).fetchall()
+
+    has_older = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
+
     runs_data = []
-    for r in runs:
+    for r in rows:
         finished = r['finished']
         duration = fmt_duration(r['started'], finished) if finished else 'running…'
         runs_data.append({
@@ -1412,7 +1468,17 @@ def sync_status():
             'bytes_fetched': _format_size(r['bytes_fetched']),
             'has_output': bool(r['bytes_fetched'] is not None),
         })
-    return render_template("sync_status.html", runs=runs_data, page_title="Sync Status")
+
+    older_url = f"/sync-status?before={rows[-1]['started']}" if has_older and rows else None
+    newer_url = "/sync-status" if before else None
+
+    known_scripts = ["buildbot", "gha", "nightly", "benchmark"]
+    last_checked = {s: fmt_time(get_last_checked(db, s)) for s in known_scripts}
+
+    return render_template("sync_status.html", runs=runs_data,
+                           older_url=older_url, newer_url=newer_url,
+                           last_checked=last_checked,
+                           page_title="Sync Status")
 
 
 @app.route("/sync-log/<int:run_id>")

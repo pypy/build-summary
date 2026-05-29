@@ -7,6 +7,7 @@
   <th>Revision</th>
   <th>Branch</th>
   <th>Date</th>
+  <th>Machine</th>
   <th>Size</th>
   <th>Build</th>
 </tr>
@@ -16,8 +17,9 @@
   <td><a href="/benchmark-results/{{ f.filename }}">{{ f.revision }}</a></td>
   <td>{{ f.branch }}</td>
   <td>{{ f.date }}</td>
+  <td>{{ f.machine }}</td>
   <td>{{ f.size }}</td>
-  <td>{% if f.build_number %}<a href="/builders/jit-benchmark-linux-x86-64/builds/{{ f.build_number }}">#{{ f.build_number }}</a>{% endif %}</td>
+  <td>{% if f.build_number %}<a href="/builders/{{ f.builder }}/builds/{{ f.build_number }}">#{{ f.build_number }}</a>{% endif %}</td>
 </tr>
 {% else %}
 <tr class="even"><td colspan="5">No benchmark results mirrored yet. Run <code>benchmark_sync.py</code> to populate.</td></tr>

@@ -18,6 +18,27 @@ import traceback
 
 OUTPUT_LIMIT = 64 * 1024  # truncate captured log at 64 KB
 
+# sync_state key prefix for last-checked timestamps of empty runs
+_CHECKED_PREFIX = "_checked_"
+
+
+def get_last_checked(db, script):
+    """Return Unix timestamp of last successful empty run for script, or None."""
+    key = _CHECKED_PREFIX + script
+    row = db.execute(
+        "SELECT last_build FROM sync_state WHERE builder = ?", (key,)
+    ).fetchone()
+    return row["last_build"] if row else None
+
+
+def _set_last_checked(conn, script, ts):
+    key = _CHECKED_PREFIX + script
+    conn.execute(
+        "INSERT INTO sync_state(builder, last_build) VALUES(?, ?)"
+        " ON CONFLICT(builder) DO UPDATE SET last_build=excluded.last_build",
+        (key, int(ts)),
+    )
+
 
 class SyncRun:
     def __init__(self, script, db_path):
@@ -26,6 +47,7 @@ class SyncRun:
         self.items_synced = 0
         self.bytes_fetched = 0
         self._run_id = None
+        self._started = None
         self._log_stream = io.StringIO()
         self._handler = None
 
@@ -45,14 +67,21 @@ class SyncRun:
             "  output TEXT"
             ")"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS sync_state ("
+            "  builder TEXT PRIMARY KEY,"
+            "  last_build INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
         # Mark any previously stuck "running" entry for this script as interrupted
         self._conn.execute(
             "UPDATE sync_runs SET status='interrupted', finished=? WHERE script=? AND status='running'",
             (time.time(), self.script),
         )
+        self._started = time.time()
         self._conn.execute(
             "INSERT INTO sync_runs (script, started, status) VALUES (?, ?, 'running')",
-            (self.script, time.time()),
+            (self.script, self._started),
         )
         self._conn.commit()
         self._run_id = self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -64,11 +93,21 @@ class SyncRun:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         logging.getLogger().removeHandler(self._handler)
+        now = time.time()
         status = 'error' if exc_type else 'ok'
         if exc_type:
             logging.getLogger(self.script).error(
                 "Unhandled exception: %s", traceback.format_exc()
             )
+
+        if status == 'ok' and self.items_synced == 0:
+            # Empty successful run — skip the sync_runs row, just update last_checked
+            self._conn.execute("DELETE FROM sync_runs WHERE id=?", (self._run_id,))
+            _set_last_checked(self._conn, self.script, now)
+            self._conn.commit()
+            self._conn.close()
+            return False
+
         invocation = "$ " + " ".join(sys.argv) + "\n"
         output = invocation + self._log_stream.getvalue()
         if len(output) > OUTPUT_LIMIT:
@@ -77,7 +116,7 @@ class SyncRun:
             """UPDATE sync_runs
                SET finished=?, status=?, items_synced=?, bytes_fetched=?, output=?
                WHERE id=?""",
-            (time.time(), status, self.items_synced, self.bytes_fetched, output, self._run_id),
+            (now, status, self.items_synced, self.bytes_fetched, output, self._run_id),
         )
         self._conn.commit()
         self._conn.close()
