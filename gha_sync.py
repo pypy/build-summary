@@ -101,7 +101,7 @@ def _gh_get(session, url, **params):
     return r.json()
 
 
-def iter_completed_runs(session, repo, workflow_file, last_run_id):
+def iter_completed_runs(session, repo, workflow_file, last_run_id, since_ts=None):
     """Yield run dicts with run_id > last_run_id, newest first, stopping early."""
     url = f"{GITHUB_API}/repos/{repo}/actions/workflows/{workflow_file}/runs"
     page = 1
@@ -113,6 +113,10 @@ def iter_completed_runs(session, repo, workflow_file, last_run_id):
         for run in runs:
             if run["id"] <= last_run_id:
                 return
+            if since_ts is not None:
+                run_ts = _parse_ts(run.get("created_at", ""))
+                if run_ts and run_ts < since_ts:
+                    return
             yield run
         if len(runs) < 50:
             break
@@ -328,12 +332,12 @@ def process_run(db, log_root, session, repo, run):
     return new_builds
 
 
-def sync(db, log_root, session, repo, workflow_file):
+def sync(db, log_root, session, repo, workflow_file, since_ts=None):
     state_key = f"_gha_{repo}_{workflow_file}"
     last_run_id = get_last_build(db, state_key)
     log.info("GHA sync: repo=%s workflow=%s last_run_id=%d", repo, workflow_file, last_run_id)
 
-    new_runs = list(iter_completed_runs(session, repo, workflow_file, last_run_id))
+    new_runs = list(iter_completed_runs(session, repo, workflow_file, last_run_id, since_ts=since_ts))
     if not new_runs:
         log.info("Nothing new")
         return 0
@@ -372,6 +376,8 @@ def main():
                         help="SQLite database path (default: %(default)s)")
     parser.add_argument("--log-root", default=DEFAULT_LOG_ROOT,
                         help="Directory for log files (default: %(default)s)")
+    parser.add_argument("--days", type=int, default=0,
+                        help="Backfill runs from the past N days (default: resume from last seen run)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -384,13 +390,14 @@ def main():
     if not token:
         log.warning("No GitHub token found; unauthenticated requests have low rate limits")
 
+    since_ts = time.time() - args.days * 86400 if args.days else None
     os.makedirs(args.log_root, exist_ok=True)
 
     with SyncRun("gha", args.db) as run:
         db = open_db(args.db)
         session = _session(token)
         start = time.time()
-        n = sync(db, args.log_root, session, args.repo, args.workflow_file)
+        n = sync(db, args.log_root, session, args.repo, args.workflow_file, since_ts=since_ts)
         run.items_synced = n
         log.info("Finished in %.1fs", time.time() - start)
         db.close()
