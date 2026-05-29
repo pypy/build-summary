@@ -67,9 +67,9 @@ from flask import (
 
 DB_PATH = os.environ.get("SUMMARY_DB", "pypy_summary.sqlite")
 LOG_ROOT = os.environ.get("LOG_ROOT", "logs")
-BUILDBOT_MASTER_ROOT = os.environ.get("BUILDBOT_MASTER_ROOT", "pypy-buildbot/master")
-NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "nightly")
-BENCH_ROOT = os.environ.get("BENCH_ROOT", "benchmark-results")
+BUILDBOT_MASTER_ROOT = os.environ.get("BUILDBOT_MASTER_ROOT", "~/buildbot/master")
+NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "~/nightly")
+BENCH_ROOT = os.environ.get("BENCH_ROOT", "~/benchmark-results")
 BUILDBOT_URL = "https://buildbot.pypy.org"
 DAYS_DEFAULT = 14
 REVS_DEFAULT = 5
@@ -585,7 +585,14 @@ def about():
         summary = lines[0]
         params = [l.strip() for l in lines[1:] if l.strip()]
         endpoints.append({"path": rule.rule, "summary": summary, "params": params})
-    return render_template("about.html", page_title="About", now=_now(), endpoints=endpoints, **VERSION_INFO)
+    runtime = {
+        "SUMMARY_DB": DB_PATH,
+        "LOG_ROOT": LOG_ROOT,
+        "BUILDBOT_MASTER_ROOT": BUILDBOT_MASTER_ROOT,
+        "NIGHTLY_ROOT": NIGHTLY_ROOT,
+        "BENCH_ROOT": BENCH_ROOT,
+    }
+    return render_template("about.html", page_title="About", now=_now(), endpoints=endpoints, runtime=runtime, **VERSION_INFO)
 
 
 @app.route("/summary")

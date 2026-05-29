@@ -11,6 +11,13 @@
   <li>Platform: {{ platform }}</li>
 </ul>
 
+<h3>Runtime Configuration</h3>
+<ul>
+  {% for key, val in runtime.items() %}
+  <li><code>{{ key }}</code>: <code>{{ val }}</code></li>
+  {% endfor %}
+</ul>
+
 <h3>Source code</h3>
 <p>
   This is a mirror and summary service for the
