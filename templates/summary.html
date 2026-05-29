@@ -24,12 +24,25 @@
 
 {% block content %}
 {% if revision %}<p>Showing results for revision <b><a href="/revision/{{ revision }}">{{ revision }}</a></b>.</p>{% endif %}
+{% if compare_branches %}
+<form method="get" action="/compare-branch" style="margin-bottom:0.75em">
+  <input type="hidden" name="branch" value="{{ current_branch }}">
+  <label for="base-select">Compare to:</label>
+  <select id="base-select" name="base">
+    {% for b in compare_branches %}
+    <option value="{{ b }}">{{ b }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit">Compare</button>
+</form>
+{% endif %}
 {% if sections %}
 {% for section in sections %}
 <h2>
   <a name="{{ section.anchor }}"></a>
   <a href="/summary?category={{ section.category }}">{{ '{' }}{{ section.category }}{{ '}' }}</a>
   <a href="/summary?branch={{ section.branch }}">{{ section.branch }}</a>
+  {% if section.branch %}<a href="/branch/{{ section.branch }}" style="font-size:0.75em">[builds]</a>{% endif %}
   {% if section.ok %} &#x2705;{% endif %}
 </h2>
 {{ section.pre_html | safe }}

@@ -73,6 +73,8 @@ BUILDBOT_URL = "https://buildbot.pypy.org"
 DAYS_DEFAULT = 14
 REVS_DEFAULT = 5
 VERSION = "0.3"
+_PRIMARY_BRANCHES_CACHE = {"branches": None, "ts": 0}
+_PRIMARY_BRANCHES_TTL = 7 * 24 * 3600
 
 app = Flask(__name__)
 app.url_map.strict_slashes = False
@@ -184,6 +186,25 @@ def revision_sort_key(rev):
         except ValueError:
             pass
     return 0
+
+
+def get_primary_branches():
+    """Return cached list of primary branches (main + active py3.1x)."""
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    if _PRIMARY_BRANCHES_CACHE["branches"] is not None and \
+            now - _PRIMARY_BRANCHES_CACHE["ts"] < _PRIMARY_BRANCHES_TTL:
+        return _PRIMARY_BRANCHES_CACHE["branches"]
+    db = get_db()
+    cutoff = now - 6 * 30 * 24 * 3600
+    rows = db.execute(
+        "SELECT DISTINCT branch FROM builds WHERE finished > ? AND branch LIKE 'py3.%'",
+        (cutoff,),
+    ).fetchall()
+    py3x = [r["branch"] for r in rows if re.fullmatch(r'py3\.\d+', r["branch"])]
+    branches = ["main"] + sorted(py3x, key=lambda b: int(b.split(".")[1]), reverse=True)
+    _PRIMARY_BRANCHES_CACHE["branches"] = branches
+    _PRIMARY_BRANCHES_CACHE["ts"] = now
+    return branches
 
 
 def short_builder(name):
@@ -313,6 +334,7 @@ def render_section_pre(
     outcomes_by_build,
     tests_pass_by_bid=None,
     bid_to_number=None,
+    compare=False,
 ):
     """
     Render section as <pre> with embedded links/spans, matching buildbot's layout.
@@ -324,7 +346,12 @@ def render_section_pre(
     if n == 0:
         return "<pre>(no builds)</pre>"
 
-    revsize = max(len(_display_rev(r["revision"])) for r in revisions)
+    def _rev_display_len(r):
+        d = _display_rev(r["revision"])
+        if compare and r.get("branch"):
+            d = f"{d} ({r['branch']})"
+        return len(d)
+    revsize = max(_rev_display_len(r) for r in revisions)
     # align = total chars before builder info on each staircase line
     align = 2 * n - 1 + revsize
     lines = []
@@ -334,9 +361,9 @@ def render_section_pre(
         bars = " |" * i
         rev_str = rev["revision"]
         display = _display_rev(rev_str)
-        merge_sha = rev.get("merge_sha")
-        title_attr = f' title="run on merge, merge commit {_html.escape(merge_sha)}"' if merge_sha else ""
-        rev_link = f'<a href="{rev["rev_url"]}"{title_attr}>{_html.escape(display)}</a>'
+        if compare and rev.get("branch"):
+            display = f"{display} ({rev['branch']})"
+        rev_link = f'<a href="{rev["rev_url"]}">{_html.escape(display)}</a>'
         padding = " " * (align - 2 * i - 1 - len(display))
         builder_parts = []
         for bshort in sorted(all_builders):
@@ -400,7 +427,7 @@ def render_section_pre(
     return "<nobr><pre>" + "".join(lines) + "</pre></nobr>"
 
 
-def build_sections(builds, outcomes_by_build, merge_sha_by_bid=None, max_revs=REVS_DEFAULT):
+def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT, compare=False):
     """
     builds: sqlite3.Row list (id, builder, number, revision, branch, category, started, finished, result, tests_pass)
     outcomes_by_build: {build_id: {test_name: outcome}}
@@ -409,7 +436,7 @@ def build_sections(builds, outcomes_by_build, merge_sha_by_bid=None, max_revs=RE
     tests_pass_by_bid = {b["id"]: b["tests_pass"] for b in builds}
     groups = {}
     for b in builds:
-        key = (b["category"], b["branch"] or "")
+        key = (b["category"], "" if compare else (b["branch"] or ""))
         groups.setdefault(key, []).append(b)
 
     sections = []
@@ -446,7 +473,7 @@ def build_sections(builds, outcomes_by_build, merge_sha_by_bid=None, max_revs=RE
                     "revision": rev,
                     "date": fmt_time(b["started"])[:10] if b["started"] else "",
                     "rev_url": f"/summary?revision={_display_rev(rev)}",
-                    "merge_sha": (merge_sha_by_bid or {}).get(b["id"]),
+                    "branch": b["branch"] or "",
                 }
 
         revisions = [rev_meta[r] for r in revisions_sorted if r in rev_meta]
@@ -506,6 +533,7 @@ def build_sections(builds, outcomes_by_build, merge_sha_by_bid=None, max_revs=RE
             outcomes_by_build,
             tests_pass_by_bid,
             bid_to_number,
+            compare=compare,
         )
 
         sections.append(
@@ -550,7 +578,7 @@ def summary():
     db = get_db()
     category = request.args.get("category")
     branch = request.args.get("branch")
-    revision = request.args.get("revision")
+    revisions = request.args.getlist("revision")
     days = int(request.args.get("days", DAYS_DEFAULT))
     max_revs = int(request.args.get("maxrev", REVS_DEFAULT))
 
@@ -563,10 +591,12 @@ def summary():
     """
     prefix = request.args.get("prefix")
     params = []
-    if revision:
-        query += " AND b.revision LIKE ?"
-        params.append("%" + revision + "%")
-        max_revs = 1
+    if revisions:
+        placeholders = " OR ".join("b.revision LIKE ?" for _ in revisions)
+        query += f" AND ({placeholders})"
+        for r in revisions:
+            params.append("%" + r + "%")
+        max_revs = len(revisions)
     else:
         cutoff = datetime.datetime.now(datetime.timezone.utc).timestamp() - days * 86400
         query += " AND b.finished > ?"
@@ -587,21 +617,11 @@ def summary():
 
     outcomes_by_build = {bid: _get_outcomes(bid) for bid in build_ids}
 
-    merge_sha_by_bid = {}
-    if build_ids:
-        placeholders = ",".join("?" * len(build_ids))
-        rows = db.execute(
-            f"SELECT build_id, value FROM properties WHERE name='merge_sha' AND build_id IN ({placeholders})",
-            build_ids,
-        ).fetchall()
-        for row in rows:
-            merge_sha_by_bid[row["build_id"]] = row["value"]
-
-    sections = build_sections(builds, outcomes_by_build, merge_sha_by_bid=merge_sha_by_bid, max_revs=max_revs)
+    sections = build_sections(builds, outcomes_by_build, max_revs=max_revs, compare=len(revisions) > 1)
 
     last_build_date = None
     suggested_days = None
-    if not sections and not revision:
+    if not sections and not revisions:
         max_query = """
             SELECT MAX(b.finished) AS ts
             FROM builds b
@@ -624,13 +644,18 @@ def summary():
             age_days = (datetime.datetime.now(datetime.timezone.utc).timestamp() - row["ts"]) / 86400
             suggested_days = int(age_days) + 2
 
+    primary_branches = get_primary_branches()
+    compare_branches = [b for b in primary_branches if b != branch] if branch else []
+
     return render_template(
         "summary.html",
         sections=sections,
         last_build_date=last_build_date,
         suggested_days=suggested_days,
         days=days,
-        revision=revision,
+        revision=revisions[0] if len(revisions) == 1 else None,
+        current_branch=branch or "",
+        compare_branches=compare_branches,
         page_title="PyPy Build Summary",
         now=fmt_time(datetime.datetime.now(datetime.timezone.utc).timestamp()),
     )
@@ -949,14 +974,57 @@ def branch(name):
     older_url = f"/branch/{name}?before={builds[-1]['started']}" if has_older and builds else None
     newer_url = f"/branch/{name}" if before else None
 
+    primary_branches = get_primary_branches()
+
     return render_template(
         "branch.html",
         branch=name,
         builds=builds_data,
         older_url=older_url,
         newer_url=newer_url,
+        primary_branches=[b for b in primary_branches if b != name],
         page_title=f"branch: {name}",
     )
+
+
+@app.route("/compare-branch")
+def compare_branch():
+    db = get_db()
+    branch_a = request.args.get("branch", "")
+    branch_b = request.args.get("base", "")
+    if not branch_a or not branch_b:
+        abort(400)
+
+    def latest_rev_and_builders(branch):
+        row = db.execute(
+            "SELECT revision FROM builds WHERE branch = ? AND revision IS NOT NULL"
+            " ORDER BY started DESC LIMIT 1",
+            (branch,),
+        ).fetchone()
+        if not row:
+            return None, set()
+        rev = row["revision"]
+        builders = {
+            r["builder"] for r in db.execute(
+                "SELECT DISTINCT builder FROM builds WHERE branch = ? AND revision = ?",
+                (branch, rev),
+            ).fetchall()
+        }
+        return _display_rev(rev), builders
+
+    rev_a, builders_a = latest_rev_and_builders(branch_a)
+    rev_b, builders_b = latest_rev_and_builders(branch_b)
+
+    if not rev_a or not rev_b:
+        abort(404)
+
+    common = builders_a & builders_b
+    prefix = os.path.commonprefix(sorted(common)) if common else ""
+
+    params = [("revision", rev_a), ("revision", rev_b)]
+    if prefix:
+        params.append(("prefix", prefix))
+    return redirect("/summary?" + urllib.parse.urlencode(params))
 
 
 @app.route("/revision/<sha>")
