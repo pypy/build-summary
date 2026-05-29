@@ -229,7 +229,7 @@ def platform_timing_and_result(jobs, platform):
 # Core processing
 # ---------------------------------------------------------------------------
 
-def process_run(db, log_root, session, repo, run):
+def process_run(db, log_root, session, repo, run, reprocess=False):
     run_id = run["id"]
     run_number = run["run_number"]
     branch = run.get("head_branch") or ""
@@ -261,7 +261,7 @@ def process_run(db, log_root, session, repo, run):
         already = db.execute(
             "SELECT 1 FROM builds WHERE builder=? AND number=?", (builder, run_number)
         ).fetchone()
-        if already:
+        if already and not reprocess:
             log.debug("  %s #%d already synced", builder, run_number)
             continue
 
@@ -354,12 +354,13 @@ def process_run(db, log_root, session, repo, run):
     return new_builds
 
 
-def sync(db, log_root, session, repo, workflow_file, since_ts=None):
+def sync(db, log_root, session, repo, workflow_file, since_ts=None, reprocess=False):
     state_key = f"_gha_{repo}_{workflow_file}"
     last_run_id = get_last_build(db, state_key)
     log.info("GHA sync: repo=%s workflow=%s last_run_id=%d", repo, workflow_file, last_run_id)
 
-    new_runs = list(iter_completed_runs(session, repo, workflow_file, last_run_id, since_ts=since_ts))
+    effective_last = 0 if reprocess else last_run_id
+    new_runs = list(iter_completed_runs(session, repo, workflow_file, effective_last, since_ts=since_ts))
     if not new_runs:
         log.info("Nothing new")
         return 0
@@ -369,7 +370,7 @@ def sync(db, log_root, session, repo, workflow_file, since_ts=None):
     max_run_id = last_run_id
     for run in new_runs:
         try:
-            n = process_run(db, log_root, session, repo, run)
+            n = process_run(db, log_root, session, repo, run, reprocess=reprocess)
             total += n
             max_run_id = max(max_run_id, run["id"])
             db.commit()
@@ -400,6 +401,8 @@ def main():
                         help="Directory for log files (default: %(default)s)")
     parser.add_argument("--days", type=int, default=0,
                         help="Backfill runs from the past N days (default: resume from last seen run)")
+    parser.add_argument("--reprocess", action="store_true",
+                        help="Re-download and overwrite already-synced runs (use with --days to limit scope)")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -419,7 +422,8 @@ def main():
         db = open_db(args.db)
         session = _session(token)
         start = time.time()
-        n = sync(db, args.log_root, session, args.repo, args.workflow_file, since_ts=since_ts)
+        n = sync(db, args.log_root, session, args.repo, args.workflow_file, since_ts=since_ts,
+                 reprocess=args.reprocess)
         run.items_synced = n
         log.info("Finished in %.1fs", time.time() - start)
         db.close()
