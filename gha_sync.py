@@ -3,7 +3,7 @@ Downloads GHA workflow run artifacts into the local SQLite database.
 Run as a cron job alongside buildbot_sync.py.
 
 Usage:
-    python gha_sync.py [--repo mattip/pypy] [--workflow-file rpython-unit-tests.yml]
+    python gha_sync.py [--repo pypyp/pypy] [--workflow-file rpython-unit-tests.yml]
                        [--db path] [--log-root path] [-v]
 
 Requires a GitHub token: set GITHUB_TOKEN env var, or have `gh` CLI authenticated.
@@ -36,7 +36,7 @@ from sync_util import SyncRun
 GITHUB_API = "https://api.github.com"
 REQUEST_TIMEOUT = 30
 DOWNLOAD_TIMEOUT = 120
-DEFAULT_REPO = "mattip/pypy"
+DEFAULT_REPO = "pypyp/pypy"
 DEFAULT_WORKFLOW_FILE = "rpython-unit-tests.yml"
 
 log = logging.getLogger(__name__)
