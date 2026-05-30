@@ -631,7 +631,7 @@ def summary():
         query += f" AND ({placeholders})"
         for r in revisions:
             params.append("%" + r + "%")
-        max_revs = len(revisions)
+        max_revs = 1000  # show all matching raw revision strings; no cap when filtering by revision
     else:
         cutoff = datetime.datetime.now(datetime.timezone.utc).timestamp() - days * 86400
         query += " AND b.finished > ?"
