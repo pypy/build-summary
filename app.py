@@ -65,7 +65,7 @@ from flask import (
     send_from_directory,
 )
 
-from sync_util import DB_PATH, LOG_ROOT, BUILDBOT_MASTER_ROOT
+from sync_util import DB_PATH, LOG_ROOT, BUILDBOT_MASTER_ROOT, migrate_db
 NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "~/nightly")
 BENCH_ROOT = os.environ.get("BENCH_ROOT", "~/benchmark-results")
 BUILDBOT_URL = "https://buildbot.pypy.org"
@@ -125,6 +125,7 @@ def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
         g.db.row_factory = sqlite3.Row
+        migrate_db(g.db)
     return g.db
 
 

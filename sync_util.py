@@ -23,6 +23,22 @@ BUILDBOT_MASTER_ROOT = os.environ.get("BUILDBOT_MASTER_ROOT", "~/buildbot/master
 
 OUTPUT_LIMIT = 64 * 1024  # truncate captured log at 64 KB
 
+
+def migrate_db(db):
+    """Apply incremental schema migrations. Safe to call on every DB open."""
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version < 1:
+        db.execute("ALTER TABLE builds ADD COLUMN source TEXT")
+        db.execute("""
+            UPDATE builds SET source = CASE
+                WHEN revision LIKE '%:%' THEN 'bb'
+                WHEN revision IS NOT NULL THEN 'gha'
+            END
+            WHERE source IS NULL
+        """)
+        db.execute("PRAGMA user_version = 1")
+        db.commit()
+
 # sync_state key prefix for last-checked timestamps of empty runs
 _CHECKED_PREFIX = "_checked_"
 

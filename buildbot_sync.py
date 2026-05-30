@@ -21,7 +21,7 @@ except ImportError:
     import zstandard as _zstd
     def _zstd_compress(data): return _zstd.ZstdCompressor().compress(data)
 
-from sync_util import DB_PATH, LOG_ROOT, SyncRun
+from sync_util import DB_PATH, LOG_ROOT, SyncRun, migrate_db
 
 BUILDBOT_URL = "https://buildbot.pypy.org"
 REQUEST_TIMEOUT = 30
@@ -42,23 +42,8 @@ def open_db(path):
     db.execute("PRAGMA foreign_keys=ON")
     with open(os.path.join(os.path.dirname(__file__), "schema.sql")) as f:
         db.executescript(f.read())
-    _migrate(db)
+    migrate_db(db)
     return db
-
-
-def _migrate(db):
-    version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version < 1:
-        db.execute("ALTER TABLE builds ADD COLUMN source TEXT")
-        db.execute("""
-            UPDATE builds SET source = CASE
-                WHEN revision LIKE '%:%' THEN 'bb'
-                WHEN revision IS NOT NULL THEN 'gha'
-            END
-            WHERE source IS NULL
-        """)
-        db.execute("PRAGMA user_version = 1")
-        db.commit()
 
 
 def upsert_builder(db, name, category):
