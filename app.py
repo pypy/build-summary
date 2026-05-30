@@ -472,11 +472,13 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT, compare=Fal
             all_builders.add(bshort)
             all_build_ids.append(b["id"])
             if rev not in rev_meta:
+                src = b["source"]
+                src_param = f"&source={src}" if src else ""
                 rev_meta[rev] = {
                     "revision": rev,
-                    "source": b["source"],
+                    "source": src,
                     "date": fmt_time(b["started"])[:10] if b["started"] else "",
-                    "rev_url": f"/summary?revision={_display_rev(rev)}",
+                    "rev_url": f"/summary?revision={_display_rev(rev)}{src_param}",
                     "branch": b["branch"] or "",
                 }
 
@@ -602,14 +604,15 @@ def about():
 def summary():
     """Build summary matrix.
     ?branch=NAME           — filter to one branch
-    ?revision=SHA          — show a specific revision; repeat to compare two
+    ?revision=SHA          — show a specific revision; repeat to compare multiple
     ?category=CAT          — filter to one platform category, e.g. ?category=linux64
-    ?prefix=STR            — filter builders whose name starts with STR, e.g. ?prefix=rpython
+    ?prefix=STR            — filter builders whose name starts with STR; repeat for multiple
     ?days=N                — how many days back to show (default 14)
     ?maxrev=N              — max revisions per section (default 5)"""
     db = get_db()
     category = request.args.get("category")
     branch = request.args.get("branch")
+    source = request.args.get("source")
     revisions = request.args.getlist("revision")
     days = int(request.args.get("days", DAYS_DEFAULT))
     max_revs = int(request.args.get("maxrev", REVS_DEFAULT))
@@ -621,7 +624,7 @@ def summary():
         JOIN builders bl ON b.builder = bl.name
         WHERE b.finished IS NOT NULL
     """
-    prefix = request.args.get("prefix")
+    prefixes = request.args.getlist("prefix")
     params = []
     if revisions:
         placeholders = " OR ".join("b.revision LIKE ?" for _ in revisions)
@@ -639,9 +642,13 @@ def summary():
     if branch:
         query += " AND b.branch = ?"
         params.append(branch)
-    if prefix:
-        query += " AND b.builder LIKE ?"
-        params.append(prefix + "%")
+    if prefixes:
+        query += " AND (" + " OR ".join("b.builder LIKE ?" for _ in prefixes) + ")"
+        for p in prefixes:
+            params.append(p + "%")
+    if source:
+        query += " AND b.source = ?"
+        params.append(source)
     query += " ORDER BY b.started"
 
     builds = db.execute(query, params).fetchall()
@@ -1038,35 +1045,42 @@ def compare_branch():
     if not branch_a or not branch_b:
         abort(400)
 
-    def latest_rev_and_builders(branch):
-        row = db.execute(
-            "SELECT revision FROM builds WHERE branch = ? AND revision IS NOT NULL"
-            " ORDER BY started DESC LIMIT 1",
-            (branch,),
-        ).fetchone()
-        if not row:
-            return None, set()
-        rev = row["revision"]
-        builders = {
-            r["builder"] for r in db.execute(
-                "SELECT DISTINCT builder FROM builds WHERE branch = ? AND revision = ?",
-                (branch, rev),
-            ).fetchall()
-        }
-        return _display_rev(rev), builders
+    def latest_rev_per_builder(branch):
+        """Return {builder: display_revision} for the latest finished build per builder."""
+        rows = db.execute(
+            """SELECT builder, revision
+               FROM builds
+               WHERE branch = ? AND revision IS NOT NULL AND finished IS NOT NULL
+                 AND started = (
+                   SELECT MAX(b2.started) FROM builds b2
+                   WHERE b2.builder = builds.builder AND b2.branch = ?
+                     AND b2.revision IS NOT NULL AND b2.finished IS NOT NULL
+                 )
+               GROUP BY builder""",
+            (branch, branch),
+        ).fetchall()
+        return {r["builder"]: _display_rev(r["revision"]) for r in rows}
 
-    rev_a, builders_a = latest_rev_and_builders(branch_a)
-    rev_b, builders_b = latest_rev_and_builders(branch_b)
+    builder_rev_a = latest_rev_per_builder(branch_a)
+    builder_rev_b = latest_rev_per_builder(branch_b)
 
-    if not rev_a or not rev_b:
+    if not builder_rev_a or not builder_rev_b:
         abort(404)
 
-    common = builders_a & builders_b
-    prefix = os.path.commonprefix(sorted(common)) if common else ""
+    common = set(builder_rev_a) & set(builder_rev_b)
+    if not common:
+        abort(404)
 
-    params = [("revision", rev_a), ("revision", rev_b)]
-    if prefix:
-        params.append(("prefix", prefix))
+    # Distinct revisions from both branches, preserving order (branch_a first)
+    seen = {}
+    for builder in sorted(common):
+        for rev in (builder_rev_a[builder], builder_rev_b[builder]):
+            seen[rev] = None
+    revisions = list(seen)
+
+    params = [("revision", r) for r in revisions]
+    for builder in sorted(common):
+        params.append(("prefix", builder))
     return redirect("/summary?" + urllib.parse.urlencode(params))
 
 
@@ -1077,7 +1091,7 @@ def revision(sha):
     db = get_db()
     category = request.args.get("category")
     query = """SELECT b.id, b.builder, b.number, b.branch, b.started, b.finished,
-                      b.result, b.tests_pass, bl.category
+                      b.result, b.tests_pass, b.source, bl.category
                FROM builds b
                JOIN builders bl ON b.builder = bl.name
                WHERE (b.revision LIKE ? OR b.revision = ?)"""
@@ -1092,6 +1106,8 @@ def revision(sha):
     builds_data = [
         {
             "builder": b["builder"],
+            "source": b["source"],
+            "source_marker": _SOURCE_MARKER.get(b["source"], ""),
             "category": b["category"],
             "number": b["number"],
             "branch": b["branch"] or "",

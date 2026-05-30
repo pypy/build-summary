@@ -1,9 +1,11 @@
 {% extends "layout.html" %}
 {% block content %}
 <h2>Builds for revision <code>{{ sha }}</code></h2>
+<p style="font-size:0.85em;color:#555">* = GitHub Actions &nbsp; + = buildbot.pypy.org</p>
 <table class="builds">
   <tr>
     <th>Builder</th>
+    <th>Source</th>
     <th>Branch</th>
     <th>Build</th>
     <th>Started</th>
@@ -14,6 +16,7 @@
   {% for b in builds %}
   <tr class="{{ b.css }}">
     <td><a href="/builders/{{ b.builder }}">{{ b.builder }}</a></td>
+    <td>{{ b.source_marker }}</td>
     <td>{% if b.branch %}<a href="/branch/{{ b.branch }}">{{ b.branch }}</a>{% endif %}</td>
     <td><a href="/builders/{{ b.builder }}/builds/{{ b.number }}">#{{ b.number }}</a></td>
     <td>{{ b.started_fmt }}</td>
