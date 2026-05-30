@@ -1045,40 +1045,35 @@ def compare_branch():
     if not branch_a or not branch_b:
         abort(400)
 
-    def latest_rev_per_builder(branch):
-        """Return {builder: display_revision} for the latest finished build per builder."""
-        rows = db.execute(
-            """SELECT builder, revision
-               FROM builds
-               WHERE branch = ? AND revision IS NOT NULL AND finished IS NOT NULL
-                 AND started = (
-                   SELECT MAX(b2.started) FROM builds b2
-                   WHERE b2.builder = builds.builder AND b2.branch = ?
-                     AND b2.revision IS NOT NULL AND b2.finished IS NOT NULL
-                 )
-               GROUP BY builder""",
-            (branch, branch),
-        ).fetchall()
-        return {r["builder"]: _display_rev(r["revision"]) for r in rows}
+    def latest_rev_and_builders(branch):
+        """Return (display_rev, {builders}) using the most recent revision but
+        all builders that have ever run on this branch."""
+        row = db.execute(
+            "SELECT revision FROM builds WHERE branch = ? AND revision IS NOT NULL"
+            " AND finished IS NOT NULL ORDER BY started DESC LIMIT 1",
+            (branch,),
+        ).fetchone()
+        if not row:
+            return None, set()
+        builders = {
+            r["builder"] for r in db.execute(
+                "SELECT DISTINCT builder FROM builds WHERE branch = ?",
+                (branch,),
+            ).fetchall()
+        }
+        return _display_rev(row["revision"]), builders
 
-    builder_rev_a = latest_rev_per_builder(branch_a)
-    builder_rev_b = latest_rev_per_builder(branch_b)
+    rev_a, builders_a = latest_rev_and_builders(branch_a)
+    rev_b, builders_b = latest_rev_and_builders(branch_b)
 
-    if not builder_rev_a or not builder_rev_b:
+    if not rev_a or not rev_b:
         abort(404)
 
-    common = set(builder_rev_a) & set(builder_rev_b)
+    common = builders_a & builders_b
     if not common:
         abort(404)
 
-    # Distinct revisions from both branches, preserving order (branch_a first)
-    seen = {}
-    for builder in sorted(common):
-        for rev in (builder_rev_a[builder], builder_rev_b[builder]):
-            seen[rev] = None
-    revisions = list(seen)
-
-    params = [("revision", r) for r in revisions]
+    params = [("revision", rev_a), ("revision", rev_b)]
     for builder in sorted(common):
         params.append(("prefix", builder))
     return redirect("/summary?" + urllib.parse.urlencode(params))
