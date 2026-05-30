@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS builds (
     slave      TEXT,
     reason     TEXT,
     tests_pass INTEGER,  -- count of passing tests; NULL means unknown
+    source     TEXT,     -- 'gha', 'bb', or 'bb-master'
     UNIQUE(builder, number)
 );
 

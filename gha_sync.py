@@ -308,7 +308,7 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
 
         build_id = insert_build(
             db, builder, run_number, sha12, branch,
-            started, finished, result, "", "gha",
+            started, finished, result, "", "", source='gha',
         )
 
         # One step per suite with its raw logs
@@ -401,7 +401,8 @@ def main():
                         help="Backfill runs from the past N days (default: resume from last seen run)")
     parser.add_argument("--reprocess", action="store_true",
                         help="Re-download and overwrite already-synced runs (use with --days to limit scope)")
-    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging (default: %(default)s)")
     args = parser.parse_args()
 
     logging.basicConfig(

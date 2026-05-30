@@ -224,9 +224,12 @@ def short_builder(name):
 import html as _html
 
 
-def _display_rev(rev_str):
-    """Strip the numeric sort prefix, leaving just the hash."""
-    return rev_str.split(":", 1)[-1] if ":" in rev_str else rev_str
+_SOURCE_MARKER = {'gha': '*', 'bb': '+', 'bb-master': '+'}
+
+def _display_rev(rev_str, source=None):
+    """Strip the numeric sort prefix, leaving just the hash, with optional source marker."""
+    h = rev_str.split(":", 1)[-1] if ":" in rev_str else rev_str
+    return h + _SOURCE_MARKER[source] if source in _SOURCE_MARKER else h
 
 
 def _lookup_outcome(outcomes, test_name):
@@ -346,7 +349,7 @@ def render_section_pre(
         return "<pre>(no builds)</pre>"
 
     def _rev_display_len(r):
-        d = _display_rev(r["revision"])
+        d = _display_rev(r["revision"], r.get("source"))
         if compare and r.get("branch"):
             d = f"{d} ({r['branch']})"
         return len(d)
@@ -359,7 +362,7 @@ def render_section_pre(
     for i, rev in enumerate(revisions):
         bars = " |" * i
         rev_str = rev["revision"]
-        display = _display_rev(rev_str)
+        display = _display_rev(rev_str, rev.get("source"))
         if compare and rev.get("branch"):
             display = f"{display} ({rev['branch']})"
         rev_link = f'<a href="{rev["rev_url"]}">{_html.escape(display)}</a>'
@@ -470,6 +473,7 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT, compare=Fal
             if rev not in rev_meta:
                 rev_meta[rev] = {
                     "revision": rev,
+                    "source": b["source"],
                     "date": fmt_time(b["started"])[:10] if b["started"] else "",
                     "rev_url": f"/summary?revision={_display_rev(rev)}",
                     "branch": b["branch"] or "",
@@ -611,7 +615,7 @@ def summary():
 
     query = """
         SELECT b.id, b.builder, b.number, b.revision, b.branch,
-               b.started, b.finished, b.result, b.tests_pass, bl.category
+               b.started, b.finished, b.result, b.tests_pass, b.source, bl.category
         FROM builds b
         JOIN builders bl ON b.builder = bl.name
         WHERE b.finished IS NOT NULL
@@ -758,25 +762,25 @@ def builder(name):
 
     if before and branch:
         rows = db.execute(
-            "SELECT id, number, revision, branch, started, finished, result FROM builds"
+            "SELECT id, number, revision, branch, started, finished, result, source FROM builds"
             " WHERE builder = ? AND branch = ? AND started < ? ORDER BY started DESC LIMIT ?",
             (name, branch, before, PAGE_SIZE + 1),
         ).fetchall()
     elif before:
         rows = db.execute(
-            "SELECT id, number, revision, branch, started, finished, result FROM builds"
+            "SELECT id, number, revision, branch, started, finished, result, source FROM builds"
             " WHERE builder = ? AND started < ? ORDER BY started DESC LIMIT ?",
             (name, before, PAGE_SIZE + 1),
         ).fetchall()
     elif branch:
         rows = db.execute(
-            "SELECT id, number, revision, branch, started, finished, result FROM builds"
+            "SELECT id, number, revision, branch, started, finished, result, source FROM builds"
             " WHERE builder = ? AND branch = ? ORDER BY started DESC LIMIT ?",
             (name, branch, PAGE_SIZE + 1),
         ).fetchall()
     else:
         rows = db.execute(
-            "SELECT id, number, revision, branch, started, finished, result FROM builds"
+            "SELECT id, number, revision, branch, started, finished, result, source FROM builds"
             " WHERE builder = ? ORDER BY started DESC LIMIT ?",
             (name, PAGE_SIZE + 1),
         ).fetchall()
@@ -786,10 +790,12 @@ def builder(name):
 
     builds_data = []
     for b in builds:
+        raw_rev = b["revision"] or ""
+        display_rev = _display_rev(raw_rev, b["source"]) if raw_rev else ""
         builds_data.append(
             {
                 "number": b["number"],
-                "revision": b["revision"] or "",
+                "revision": display_rev,
                 "branch": b["branch"] or "",
                 "started_fmt": fmt_time(b["started"]),
                 "duration": fmt_duration(b["started"], b["finished"]),
@@ -976,13 +982,13 @@ def branch(name):
 
     if before:
         rows = db.execute(
-            "SELECT id, builder, number, revision, started, finished, result FROM builds"
+            "SELECT id, builder, number, revision, started, finished, result, source FROM builds"
             " WHERE branch = ? AND started < ? ORDER BY started DESC LIMIT ?",
             (name, before, PAGE_SIZE + 1),
         ).fetchall()
     else:
         rows = db.execute(
-            "SELECT id, builder, number, revision, started, finished, result FROM builds"
+            "SELECT id, builder, number, revision, started, finished, result, source FROM builds"
             " WHERE branch = ? ORDER BY started DESC LIMIT ?",
             (name, PAGE_SIZE + 1),
         ).fetchall()
@@ -993,12 +999,12 @@ def branch(name):
     builds_data = []
     for b in builds:
         raw_rev = b["revision"] or ""
-        display_rev = _display_rev(raw_rev)
+        display_rev = _display_rev(raw_rev, b["source"]) if raw_rev else ""
         builds_data.append({
             "builder": b["builder"],
             "number": b["number"],
             "revision": display_rev,
-            "rev_url": f"/revision/{display_rev}" if display_rev else "",
+            "rev_url": f"/revision/{_display_rev(raw_rev)}" if raw_rev else "",
             "started_fmt": fmt_time(b["started"]),
             "result_text": RESULT_TEXT.get(b["result"], "running" if b["finished"] is None else "—"),
             "css": RESULT_CSS.get(b["result"], "running" if b["finished"] is None else ""),

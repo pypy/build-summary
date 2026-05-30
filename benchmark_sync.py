@@ -139,10 +139,11 @@ def main():
                         help="Directory for benchmark result files (default: %(default)s)")
     parser.add_argument("--source-root", default="",
                         help="Local directory already containing benchmark JSON files; "
-                             "symlink from here instead of downloading")
+                             "symlink from here instead of downloading (default: %(default)r)")
     parser.add_argument("--db", default=DB_PATH,
                         help="SQLite database path (default: %(default)s)")
-    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging (default: %(default)s)")
     args = parser.parse_args()
 
     logging.basicConfig(

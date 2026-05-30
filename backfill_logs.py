@@ -58,9 +58,12 @@ def backfill(db_path, log_root):
 
 def main():
     parser = argparse.ArgumentParser(description="Backfill missing pytestLog files")
-    parser.add_argument("--db", default=DB_PATH)
-    parser.add_argument("--log-root", default=LOG_ROOT)
-    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--db", default=DB_PATH,
+                        help="SQLite database path (default: %(default)s)")
+    parser.add_argument("--log-root", default=LOG_ROOT,
+                        help="Directory for log files (default: %(default)s)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging (default: %(default)s)")
     args = parser.parse_args()
 
     logging.basicConfig(

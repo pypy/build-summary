@@ -42,7 +42,23 @@ def open_db(path):
     db.execute("PRAGMA foreign_keys=ON")
     with open(os.path.join(os.path.dirname(__file__), "schema.sql")) as f:
         db.executescript(f.read())
+    _migrate(db)
     return db
+
+
+def _migrate(db):
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version < 1:
+        db.execute("ALTER TABLE builds ADD COLUMN source TEXT")
+        db.execute("""
+            UPDATE builds SET source = CASE
+                WHEN revision LIKE '%:%' THEN 'bb'
+                WHEN revision IS NOT NULL THEN 'gha'
+            END
+            WHERE source IS NULL
+        """)
+        db.execute("PRAGMA user_version = 1")
+        db.commit()
 
 
 def upsert_builder(db, name, category):
@@ -67,11 +83,11 @@ def set_last_build(db, builder, number):
     )
 
 
-def insert_build(db, builder, number, revision, branch, started, finished, result, slave, reason):
+def insert_build(db, builder, number, revision, branch, started, finished, result, slave, reason, source=None):
     cur = db.execute(
         """
-        INSERT INTO builds(builder, number, revision, branch, started, finished, result, slave, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO builds(builder, number, revision, branch, started, finished, result, slave, reason, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(builder, number) DO UPDATE SET
             revision = excluded.revision,
             branch   = excluded.branch,
@@ -79,10 +95,11 @@ def insert_build(db, builder, number, revision, branch, started, finished, resul
             finished = excluded.finished,
             result   = excluded.result,
             slave    = excluded.slave,
-            reason   = excluded.reason
+            reason   = excluded.reason,
+            source   = excluded.source
         RETURNING id
         """,
-        (builder, number, revision, branch, started, finished, result, slave, reason),
+        (builder, number, revision, branch, started, finished, result, slave, reason, source),
     )
     return cur.fetchone()["id"]
 
@@ -278,7 +295,8 @@ def process_build(db, log_root, builder, build_data, skip_logs=False):
     if isinstance(result, list):
         result = result[0]
 
-    build_id = insert_build(db, builder, number, revision, branch, started, finished, result, slave, reason)
+    source = 'bb-master' if skip_logs else 'bb'
+    build_id = insert_build(db, builder, number, revision, branch, started, finished, result, slave, reason, source)
     insert_steps(db, build_id, build_data.get("steps", []))
     insert_properties(db, build_id, props)
 
@@ -406,11 +424,12 @@ def main():
                         help="Directory for log files (default: %(default)s)")
     parser.add_argument("--master-root", default="",
                         help="Path to buildbot master directory; if set, skip downloading "
-                             "log files (they will be read directly from the master)")
+                             "log files (they will be read directly from the master) (default: %(default)r)")
     parser.add_argument("--days", type=int, default=0,
                         help="Backfill builds from the past N days "
                              "(default: last %d per builder)" % INITIAL_BACKFILL)
-    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging (default: %(default)s)")
     args = parser.parse_args()
 
     logging.basicConfig(
