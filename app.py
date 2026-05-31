@@ -124,6 +124,17 @@ body.show-ts .ts{display:inline}
 """
 
 
+_BB_LOG_STYLE = """
+body{margin:0;padding:8px;font:12px/1.5 monospace;background:#fff;color:#333;white-space:pre-wrap;word-break:break-all}
+"""
+
+
+def _bb_log_to_html(text):
+    """Render a buildbot log (post chunk-strip) as a standalone HTML page with ANSI codes converted."""
+    body = '\n'.join(_ansi_to_html(line) for line in text.splitlines())
+    return f'<!DOCTYPE html><html><head><meta charset="utf-8"><style>{_BB_LOG_STYLE}</style></head><body>{body}</body></html>'
+
+
 def _render_log_line(raw):
     """Wrap timestamp prefix in <span class="ts"> and ANSI-convert the rest."""
     m = _GHA_TS_RE.match(raw)
@@ -1386,7 +1397,7 @@ def serve_log(rel_path):
     # Try BUILDBOT_MASTER_ROOT
     master_path = _master_log_path(builder, number, step, log_name)
     if master_path:
-        return Response(read_log_file(master_path), mimetype="text/plain")
+        return Response(_bb_log_to_html(read_log_file(master_path)), mimetype="text/html")
 
     # Last resort: proxy from buildbot.pypy.org with a banner
     is_text = rel_path.endswith(".txt")
