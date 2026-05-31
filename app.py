@@ -1083,12 +1083,11 @@ def build(name, number_str):
             if step_name != sname:
                 continue
             logs.append({"name": log_name, "url": f"/logs/{path}"})
-        # Link non-mirrored logs to buildbot HTML viewer using stored log_names
+        # Link non-mirrored logs via serve_log (resolves LOG_ROOT → BUILDBOT_MASTER_ROOT → proxy)
         step_log_names = json.loads(step["log_names"]) if step["log_names"] else []
         for log_name in step_log_names:
             if log_name not in local_log_names and log_name != "pytestLog":
-                bb_url = f"{BUILDBOT_URL}/builders/{name}/builds/{number}/steps/{sname}/logs/{log_name}"
-                logs.append({"name": log_name, "url": bb_url})
+                logs.append({"name": log_name, "url": f"/logs/{name}/{number}/{sname}/{log_name}.txt"})
         steps_data.append({
             "name": sname,
             "text": step["text"] or "",
