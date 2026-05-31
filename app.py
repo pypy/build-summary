@@ -1202,7 +1202,7 @@ def longrepr(build_id, test_name):
 
     db = get_db()
     build = db.execute(
-        "SELECT builder, number FROM builds WHERE id = ?", (build_id,)
+        "SELECT builder, number, source FROM builds WHERE id = ?", (build_id,)
     ).fetchone()
     if not build:
         abort(404)
