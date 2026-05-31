@@ -56,6 +56,15 @@ def read_log_file(path):
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read()
 
+
+def _read_master_log(path):
+    """Read a buildbot master log file, always stripping netstring chunk headers."""
+    if path.endswith(".bz2"):
+        with open(path, "rb") as f:
+            return _strip_bb_chunks(bz2.decompress(f.read()))
+    with open(path, "rb") as f:
+        return _strip_bb_chunks(f.read())
+
 _GHA_TS_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z ')
 _GHA_TS_PARSE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)')
 
@@ -1388,6 +1397,7 @@ def serve_log(rel_path):
     if len(parts) != 4:
         abort(404)
     builder, number, step, logfile = parts
+    raw_number = number.rstrip('*+')  # strip source marker for filesystem/URL lookups
     log_name = logfile
     for suffix in (".txt.zst", ".txt", ".html"):
         if log_name.endswith(suffix):
@@ -1395,14 +1405,14 @@ def serve_log(rel_path):
             break
 
     # Try BUILDBOT_MASTER_ROOT
-    master_path = _master_log_path(builder, number, step, log_name)
+    master_path = _master_log_path(builder, raw_number, step, log_name)
     if master_path:
-        return Response(_bb_log_to_html(read_log_file(master_path)), mimetype="text/html")
+        return Response(_bb_log_to_html(_read_master_log(master_path)), mimetype="text/html")
 
     # Last resort: proxy from buildbot.pypy.org with a banner
     is_text = rel_path.endswith(".txt")
     src_url = (
-        f"{BUILDBOT_URL}/builders/{builder}/builds/{number}"
+        f"{BUILDBOT_URL}/builders/{builder}/builds/{raw_number}"
         f"/steps/{step}/logs/{log_name}" + ("/text" if is_text else "")
     )
     try:

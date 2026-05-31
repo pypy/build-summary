@@ -7,3 +7,6 @@ __pycache__/
 *.swp
 .venv*/
 memory/
+# for local development, can be deleted
+pypy-buildbot
+buildbot
