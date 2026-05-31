@@ -73,7 +73,7 @@ def insert_build(db, builder, number, revision, branch, started, finished, resul
         """
         INSERT INTO builds(builder, number, revision, branch, started, finished, result, slave, reason, source)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(builder, number) DO UPDATE SET
+        ON CONFLICT(builder, number, source) DO UPDATE SET
             revision = excluded.revision,
             branch   = excluded.branch,
             started  = excluded.started,
