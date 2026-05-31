@@ -58,6 +58,21 @@ CREATE TABLE IF NOT EXISTS logs (
     PRIMARY KEY(build_id, step_name, log_name)
 );
 
+-- Per-step metadata for GHA builds: setup and teardown steps from the
+-- representative job for each platform build.
+CREATE TABLE IF NOT EXISTS gha_steps (
+    build_id    INTEGER NOT NULL REFERENCES builds(id),
+    job_id      INTEGER NOT NULL,
+    step_number INTEGER NOT NULL,
+    name        TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,  -- 'setup' or 'teardown'
+    result      INTEGER,
+    started     REAL,
+    finished    REAL,
+    log_path    TEXT,              -- relative to LOG_ROOT; NULL if log unavailable
+    PRIMARY KEY(build_id, step_number)
+);
+
 -- Poller checkpoint: highest build number fully ingested per builder.
 -- Lets the cron job resume without re-fetching old builds.
 CREATE TABLE IF NOT EXISTS sync_state (

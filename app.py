@@ -48,12 +48,190 @@ def read_log_file(path):
     """Read a log file, decompressing .zst or .bz2 transparently."""
     if path.endswith(".zst"):
         with open(path, "rb") as f:
-            return _zstd_decompress(f.read()).decode("utf-8", errors="replace")
+            text = _zstd_decompress(f.read()).decode("utf-8", errors="replace")
+        return text.removeprefix('﻿').removeprefix('ï»¿')
     if path.endswith(".bz2"):
         with open(path, "rb") as f:
             return _strip_bb_chunks(bz2.decompress(f.read()))
     with open(path, encoding="utf-8", errors="replace") as f:
         return f.read()
+
+_GHA_TS_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z ')
+_GHA_TS_PARSE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)')
+
+
+def _log_line_ts(line):
+    m = _GHA_TS_PARSE_RE.match(line)
+    if not m:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(m.group(1).replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return None
+
+
+_STEP_GROUP_PREFIXES = ('Run ', 'Post Run ', 'Complete job', 'Post job cleanup')
+_GHA_SHA_RE = re.compile(r'@[0-9a-f]{40}')  # strip pinned commit SHAs from action names
+
+_ANSI_RE = re.compile(r'\x1b\[([0-9;]*)m')
+_ANSI_FG = {
+    '30': '#555555', '31': '#c0392b', '32': '#27ae60', '33': '#b7770d',
+    '34': '#1a5fa8', '35': '#8e44ad', '36': '#0e8c75', '37': '#666666',
+}
+
+import html as _html_mod
+
+
+def _ansi_to_html(text):
+    """HTML-escape text and convert ANSI color/bold codes to inline-style spans."""
+    parts = []
+    last = 0
+    open_spans = 0
+    for m in _ANSI_RE.finditer(text):
+        parts.append(_html_mod.escape(text[last:m.start()]))
+        last = m.end()
+        codes = m.group(1).split(';') if m.group(1) else ['0']
+        if '0' in codes or not m.group(1):
+            parts.append('</span>' * open_spans)
+            open_spans = 0
+            codes = [c for c in codes if c != '0']
+        styles = []
+        for code in codes:
+            if code == '1':
+                styles.append('font-weight:bold')
+            elif code in _ANSI_FG:
+                styles.append(f'color:{_ANSI_FG[code]}')
+        if styles:
+            parts.append(f'<span style="{";".join(styles)}">')
+            open_spans += 1
+    parts.append(_html_mod.escape(text[last:]))
+    if open_spans:
+        parts.append('</span>' * open_spans)
+    return ''.join(parts)
+
+
+_GHA_LOG_STYLE = """
+body{margin:0;padding:28px 8px 8px;font:12px/1.5 monospace;background:#fff;color:#333;white-space:pre-wrap;word-break:break-all}
+details{margin:1px 0}
+summary{cursor:pointer;list-style:none;padding:0 4px;background:#f0f0f0;color:#555;white-space:pre;border-left:3px solid #ccc}
+summary::-webkit-details-marker{display:none}
+summary::before{content:'▶ ';font-size:10px}
+details[open]>summary::before{content:'▼ '}
+.g{padding-left:16px;border-left:2px solid #ddd}
+.ts{display:none;color:#999}
+body.show-ts .ts{display:inline}
+#ts-btn{position:fixed;top:4px;left:4px;font:11px sans-serif;padding:2px 8px;cursor:pointer;opacity:0.7;background:#eee;border:1px solid #ccc}
+"""
+
+
+def _render_log_line(raw):
+    """Wrap timestamp prefix in <span class="ts"> and ANSI-convert the rest."""
+    m = _GHA_TS_RE.match(raw)
+    if m:
+        return (f'<span class="ts">{_html_mod.escape(raw[:m.end()])}</span>'
+                f'{_ansi_to_html(raw[m.end():])}')
+    return _ansi_to_html(raw)
+
+
+def _log_section_to_html(content, title):
+    """Convert step log content (raw lines with timestamps + ANSI codes) to a standalone HTML page."""
+    lines_html = []
+    in_group = False
+    lines_iter = iter(content.splitlines())
+
+    # For actions/* steps the first line is "Run actions/foo@sha" (no timestamp —
+    # it came from the ##[group] header) followed by with: lines ending at ##[endgroup].
+    first = next(lines_iter, None)
+    if first is not None:
+        bare_first = _GHA_TS_RE.sub('', first)
+        if bare_first.startswith(('Run actions/', 'Run setup/')):
+            summary = _html_mod.escape(_GHA_SHA_RE.sub('', bare_first))
+            lines_html.append(f'<details><summary>{summary}</summary><div class="g">\n')
+            lines_html.append(_ansi_to_html(bare_first) + '\n')
+            for line in lines_iter:
+                if _GHA_TS_RE.sub('', line).startswith('##[endgroup]'):
+                    lines_html.append('</div></details>\n')
+                    break
+                lines_html.append(_render_log_line(line) + '\n')
+        else:
+            lines_html.append(_render_log_line(first) + '\n')
+
+    for line in lines_iter:
+        bare = _GHA_TS_RE.sub('', line)
+        if bare.startswith('##[group]'):
+            name = _html_mod.escape(bare[9:].rstrip())
+            if in_group:
+                lines_html.append('</div></details>\n')
+            lines_html.append(f'<details><summary>{name}</summary><div class="g">\n')
+            in_group = True
+        elif bare.startswith('##[endgroup]'):
+            if in_group:
+                lines_html.append('</div></details>\n')
+                in_group = False
+        else:
+            lines_html.append(_render_log_line(line) + '\n')
+    if in_group:
+        lines_html.append('</div></details>\n')
+    t = _html_mod.escape(title)
+    body = ''.join(lines_html)
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{t}</title>'
+            f'<style>{_GHA_LOG_STYLE}</style></head>'
+            f'<body><button id="ts-btn" onclick="document.body.classList.toggle(\'show-ts\')">'
+            f'timestamps</button>{body}</body></html>')
+
+
+def _parse_job_log_section(log_text, step_name, step_started, step_finished):
+    """Return the content for one step from the full job log.
+
+    'Set up job': everything before the first step-level ##[group] marker.
+
+    Steps with a ##[group] marker (setup/run steps): find the marker whose
+    timestamp falls within [step_started-1, step_finished+1], collect lines
+    until the next step-level ##[group] marker OR a bare 'Post job cleanup.'
+    line (GHA runner teardown output that appears without a group wrapper).
+
+    Teardown steps (no ##[group] marker): collect lines whose timestamps fall
+    within [step_started-1, step_finished+1].
+
+    Sub-group ##[group]/##[endgroup] markers are preserved for HTML rendering.
+    """
+    in_section = False
+    lines = []
+    for line in log_text.splitlines(keepends=True):
+        content = _GHA_TS_RE.sub('', line)
+        if content.startswith('##[group]'):
+            hdr = content[9:].rstrip('\n\r')
+            if any(hdr.startswith(p) for p in _STEP_GROUP_PREFIXES):
+                if step_name == 'Set up job':
+                    break
+                if in_section:
+                    break  # next step started
+                marker_ts = _log_line_ts(line)
+                if marker_ts is not None and step_started - 1 <= marker_ts <= step_finished + 1:
+                    in_section = True
+                    lines = [hdr + '\n']
+                continue
+        if step_name == 'Set up job':
+            lines.append(line)
+        elif in_section:
+            if content.startswith('Post job cleanup'):
+                break
+            lines.append(line)
+    return ''.join(lines)
+
+
+def _extract_teardown_content(log_text):
+    """Return all log content from the first 'Post job cleanup.' line to EOF."""
+    lines = []
+    in_teardown = False
+    for line in log_text.splitlines(keepends=True):
+        content = _GHA_TS_RE.sub('', line)
+        if not in_teardown and content.startswith('Post job cleanup'):
+            in_teardown = True
+        if in_teardown:
+            lines.append(line)
+    return ''.join(lines)
+
 
 from flask import (
     Flask,
@@ -574,7 +752,7 @@ def index():
     return render_template("index.html", page_title="PyPy Buildbot", now=_now())
 
 
-_INTERNAL_ENDPOINTS = {"static_files", "serve_log", "serve_nightly_file", "serve_benchmark_file", "sync_log"}
+_INTERNAL_ENDPOINTS = {"static_files", "serve_log", "serve_nightly_file", "serve_benchmark_file", "sync_log", "gha_step_log", "gha_teardown_log", "longrepr"}
 
 @app.route("/about")
 def about():
@@ -836,7 +1014,7 @@ def build(name, number):
     """Detail page for a single build: steps, logs, test outcomes."""
     db = get_db()
     b = db.execute(
-        "SELECT id, revision, branch, started, finished, result, slave, reason FROM builds"
+        "SELECT id, revision, branch, started, finished, result, slave, reason, source FROM builds"
         " WHERE builder = ? AND number = ?",
         (name, number),
     ).fetchone()
@@ -906,6 +1084,47 @@ def build(name, number):
         (b["id"],),
     ).fetchall()
 
+    is_gha = b["source"] == "gha"
+    gha_setup = []
+    gha_finalize = []
+    gha_log_path = None
+    if is_gha:
+        for row in db.execute(
+            "SELECT step_number, name, kind, result, started, finished, log_path"
+            " FROM gha_steps WHERE build_id = ? ORDER BY step_number",
+            (b["id"],),
+        ):
+            if row["log_path"]:
+                gha_log_path = row["log_path"]
+            if row["kind"] not in ("setup", "finalize"):
+                continue
+            entry = {
+                "name": _GHA_SHA_RE.sub('', row["name"]),
+                "result_text": RESULT_TEXT.get(row["result"], "—"),
+                "css": RESULT_CSS.get(row["result"], ""),
+                "duration": fmt_duration(row["started"], row["finished"]),
+                "log_url": (f"/gha-log/{b['id']}/{row['step_number']}"
+                            if row["log_path"] else None),
+            }
+            if row["kind"] == "setup":
+                gha_setup.append(entry)
+            else:
+                gha_finalize.append(entry)
+        if gha_log_path:
+            gha_finalize.append({
+                "name": "Post job cleanup",
+                "result_text": "—",
+                "css": "",
+                "duration": None,
+                "log_url": f"/gha-teardown-log/{b['id']}",
+            })
+
+    gha_combined = None
+    if is_gha:
+        idx = next((i for i, s in enumerate(steps_data) if s["name"] == "combined"), None)
+        if idx is not None:
+            gha_combined = steps_data.pop(idx)
+
     raw_rev = b["revision"] or ""
     display_rev = _display_rev(raw_rev)
     branch = b["branch"] or ""
@@ -932,6 +1151,8 @@ def build(name, number):
         result_css=RESULT_CSS.get(b["result"], "running" if b["finished"] is None else ""),
         slave=b["slave"] or "", reason=b["reason"] or "",
         steps=steps_data, props=props_data,
+        is_gha=is_gha, gha_setup=gha_setup, gha_finalize=gha_finalize,
+        gha_combined=gha_combined,
         page_title=f"{name} #{number}",
     )
 
@@ -1167,6 +1388,55 @@ def serve_log(rel_path):
         return Response(content.replace("<body>", f"<body>\n{banner}", 1), mimetype="text/html")
     except Exception:
         return redirect(src_url, code=302)
+
+
+@app.route("/gha-log/<int:build_id>/<int:step_number>")
+def gha_step_log(build_id, step_number):
+    """Serve one GHA setup/teardown step log, sliced from the stored full job log by timestamp."""
+    from flask import Response
+    db = get_db()
+    row = db.execute(
+        "SELECT name, log_path, started, finished FROM gha_steps"
+        " WHERE build_id = ? AND step_number = ?",
+        (build_id, step_number),
+    ).fetchone()
+    if not row or not row["log_path"]:
+        abort(404)
+    if not row["started"] or not row["finished"]:
+        abort(404)
+    full_path = os.path.join(LOG_ROOT, row["log_path"])
+    if not os.path.exists(full_path):
+        abort(404)
+    log_text = read_log_file(full_path)
+    section = _parse_job_log_section(log_text, row["name"], row["started"], row["finished"])
+    display_name = _GHA_SHA_RE.sub('', row["name"])
+    return Response(
+        _log_section_to_html(section or log_text, display_name),
+        mimetype="text/html",
+    )
+
+
+@app.route("/gha-teardown-log/<int:build_id>")
+def gha_teardown_log(build_id):
+    """Serve the post-job-cleanup content for a GHA build (everything from 'Post job cleanup.' to EOF)."""
+    from flask import Response
+    db = get_db()
+    row = db.execute(
+        "SELECT log_path FROM gha_steps WHERE build_id = ? AND log_path IS NOT NULL LIMIT 1",
+        (build_id,),
+    ).fetchone()
+    if not row:
+        abort(404)
+    full_path = os.path.join(LOG_ROOT, row["log_path"])
+    if not os.path.exists(full_path):
+        abort(404)
+    content = _extract_teardown_content(read_log_file(full_path))
+    if not content:
+        abort(404)
+    return Response(
+        _log_section_to_html(content, "Post job cleanup"),
+        mimetype="text/html",
+    )
 
 
 _PYPY_PLATFORMS = {

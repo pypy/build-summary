@@ -14,10 +14,79 @@
 {% if revision %}<tr class="alt"><td class="left">Revision</td><td><a href="{{ rev_url }}"><code>{{ revision }}</code></a></td></tr>{% endif %}
 </table>
 
-{% if slave %}<h2>BuildSlave:</h2><p>{{ slave }}</p>{% endif %}
-{% if reason %}<h2>Reason:</h2><p>{{ reason }}</p>{% endif %}
+{% if slave %}<h2>Worker:</h2><p>{{ slave }}</p>{% endif %}
+{% if reason %}<h2>Reason:</h2><p>{% if reason.startswith('https://') %}<a href="{{ reason }}">{{ reason }}</a>{% else %}{{ reason }}{% endif %}</p>{% endif %}
 
 <h2>Steps and Logfiles:</h2>
+{% if is_gha %}
+
+{% if gha_setup %}
+<h3>Setup</h3>
+<ol>
+{% for step in gha_setup %}
+  <li>
+    <div class="{{ step.css }} result">
+      {{ step.name }}
+      &nbsp;<span style="float:right">{% if step.duration %}( {{ step.duration }} ){% endif %}</span>
+    </div>
+    {% if step.log_url %}
+    <ol><li><a href="{{ step.log_url }}">stdio</a></li></ol>
+    {% endif %}
+  </li>
+{% endfor %}
+</ol>
+{% endif %}
+
+<h3>Test runs</h3>
+<ol>
+{% for step in steps %}
+  <li>
+    <div class="{{ step.css }} result">
+      {{ step.name }}
+      &nbsp;<span style="float:right">{% if step.duration %}( {{ step.duration }} ){% endif %}</span>
+    </div>
+    <ol>
+      {% for log in step.logs %}
+        <li><a href="{{ log.url }}">{{ log.name }}</a></li>
+      {% else %}
+        <li>- no logs -</li>
+      {% endfor %}
+    </ol>
+  </li>
+{% endfor %}
+{% if gha_combined %}
+  <li>
+    <div class="{{ gha_combined.css }} result">
+      combined (all suites)
+      &nbsp;<span style="float:right">{% if gha_combined.duration %}( {{ gha_combined.duration }} ){% endif %}</span>
+    </div>
+    <ol>
+      {% for log in gha_combined.logs %}
+        <li><a href="{{ log.url }}">{{ log.name }}</a></li>
+      {% endfor %}
+    </ol>
+  </li>
+{% endif %}
+</ol>
+
+{% if gha_finalize %}
+<h3>Finalize</h3>
+<ol>
+{% for step in gha_finalize %}
+  <li>
+    <div class="{{ step.css }} result">
+      {{ step.name }}
+      &nbsp;<span style="float:right">{% if step.duration %}( {{ step.duration }} ){% endif %}</span>
+    </div>
+    {% if step.log_url %}
+    <ol><li><a href="{{ step.log_url }}">stdio</a></li></ol>
+    {% endif %}
+  </li>
+{% endfor %}
+</ol>
+{% endif %}
+
+{% else %}
 <ol>
 {% for step in steps %}
   <li>
@@ -35,6 +104,7 @@
   </li>
 {% endfor %}
 </ol>
+{% endif %}
 
 </div>
 <div class="column">

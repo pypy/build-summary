@@ -38,6 +38,37 @@ def migrate_db(db):
         """)
         db.execute("PRAGMA user_version = 1")
         db.commit()
+    if version < 2:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS gha_steps (
+                build_id    INTEGER NOT NULL REFERENCES builds(id),
+                job_id      INTEGER NOT NULL,
+                step_number INTEGER NOT NULL,
+                name        TEXT    NOT NULL,
+                kind        TEXT    NOT NULL,
+                result      INTEGER,
+                started     REAL,
+                finished    REAL,
+                log_path    TEXT,
+                PRIMARY KEY(build_id, step_number)
+            )
+        """)
+        db.execute("PRAGMA user_version = 2")
+        db.commit()
+    if version < 3:
+        # Rename: post-test steps before Post*/Complete are now 'finalize'
+        db.execute("""
+            UPDATE gha_steps SET kind = 'finalize'
+            WHERE kind = 'setup' AND name = 'Upload test logs'
+        """)
+        db.execute("""
+            UPDATE gha_steps SET kind = 'finalize'
+            WHERE kind = 'teardown'
+              AND name NOT LIKE 'Post %'
+              AND name != 'Complete job'
+        """)
+        db.execute("PRAGMA user_version = 3")
+        db.commit()
 
 # sync_state key prefix for last-checked timestamps of empty runs
 _CHECKED_PREFIX = "_checked_"

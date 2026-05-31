@@ -224,6 +224,94 @@ def platform_timing_and_result(jobs, platform):
 
 
 # ---------------------------------------------------------------------------
+# GHA job step helpers
+# ---------------------------------------------------------------------------
+
+def _split_job_steps(steps):
+    """Split job steps into (setup_steps, finalize_steps, teardown_steps).
+
+    "Post *" and "Complete job" are teardown.  The first "Run " step that isn't
+    a GitHub Action wrapper (Run actions/... or Run setup/...) is the test
+    execution step — skip it.  Everything after it (until Post/Complete) is
+    finalize (e.g. "Upload testrun.log").
+    """
+    setup, finalize, teardown = [], [], []
+    past_test = False
+    for step in steps:
+        name = step.get("name", "")
+        if name.startswith("Post ") or name == "Complete job":
+            teardown.append(step)
+        elif not past_test and (not name.startswith("Run ") or
+                                name.startswith(("Run actions/", "Run setup/"))):
+            setup.append(step)
+        elif not past_test:
+            past_test = True   # first non-action Run step = test execution; skip it
+        else:
+            finalize.append(step)
+    return setup, finalize, teardown
+
+
+def runner_label(jobs, platform):
+    """Return the runner label (worker name) from the first alphabetically-matching job."""
+    for job in sorted(jobs, key=lambda j: j.get("name", "")):
+        if job.get("name", "").endswith(f"({platform})"):
+            labels = job.get("labels", [])
+            return labels[0] if labels else ""
+    return ""
+
+
+def fetch_job_log(session, repo, job_id):
+    """Download the full text log for a GHA job; returns text or None."""
+    url = f"{GITHUB_API}/repos/{repo}/actions/jobs/{job_id}/logs"
+    r = session.get(url, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+    if r.status_code in (404, 410):
+        return None
+    if r.status_code in (403, 429):
+        reset_ts = r.headers.get("x-ratelimit-reset")
+        retry_after = r.headers.get("retry-after")
+        wait = (int(retry_after) if retry_after
+                else (max(0, int(reset_ts) - int(time.time())) + 1 if reset_ts else 60))
+        log.warning("Rate limited fetching job log; sleeping %ds", wait)
+        time.sleep(wait)
+        r = session.get(url, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+    if r.status_code in (404, 410):
+        return None
+    r.raise_for_status()
+    return r.text
+
+
+def _store_gha_job_steps(db, build_id, log_root, builder, fs_number, session, repo, job):
+    """Download and store the full log for a representative job, then record
+    its setup/teardown steps in gha_steps."""
+    job_id = job["id"]
+    setup_steps, finalize_steps, teardown_steps = _split_job_steps(job.get("steps") or [])
+
+    log_text = fetch_job_log(session, repo, job_id)
+    log_path = None
+    if log_text:
+        log_path = save_log_file(log_root, builder, fs_number, f"job-{job_id}", "stdio", log_text)
+
+    all_steps = ([(s, "setup") for s in setup_steps] +
+                 [(s, "finalize") for s in finalize_steps] +
+                 [(s, "teardown") for s in teardown_steps])
+    for step_number, (step, kind) in enumerate(all_steps):
+        conclusion = step.get("conclusion") or ""
+        result = GHA_RESULT_MAP.get(conclusion, 4) if conclusion else None
+        db.execute(
+            """INSERT INTO gha_steps
+                   (build_id, job_id, step_number, name, kind, result, started, finished, log_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(build_id, step_number) DO UPDATE SET
+                   name=excluded.name, kind=excluded.kind, result=excluded.result,
+                   started=excluded.started, finished=excluded.finished,
+                   log_path=excluded.log_path""",
+            (build_id, job_id, step_number, step.get("name", ""), kind, result,
+             _parse_ts(step.get("started_at")), _parse_ts(step.get("completed_at")),
+             log_path),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
 
@@ -236,6 +324,7 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
     log.info("Run #%d (id=%d) branch=%s sha=%s", run_number, run_id, branch, sha12)
     jobs = fetch_jobs(session, repo, run_id)
     artifacts = fetch_artifacts(session, repo, run_id)
+    run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
 
     # Group artifacts by platform, preserving suite name
     by_platform = {}  # platform → [(suite, artifact), ...]
@@ -264,6 +353,7 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
             continue
 
         started, finished, result = platform_timing_and_result(jobs, platform)
+        worker = runner_label(jobs, platform)
 
         # Download each suite artifact; collect raw logs and merged pytestLog text
         merged_parts = []
@@ -308,7 +398,7 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
 
         build_id = insert_build(
             db, builder, run_number, sha12, branch,
-            started, finished, result, "", "", source='gha',
+            started, finished, result, worker, run_url, source='gha',
         )
 
         # One step per suite with its raw logs
@@ -347,6 +437,20 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
             "\n".join(merged_parts), log_root,
         )
         log.info("  %s #%d: %d outcomes, %d bytes", builder, run_number, n, bytes_total)
+
+        # Store setup/teardown steps from the first matching job for this platform
+        rep_job = next(
+            (j for j in sorted(jobs, key=lambda j: j.get("name", ""))
+             if j.get("name", "").endswith(f"({platform})")),
+            None,
+        )
+        if rep_job:
+            try:
+                _store_gha_job_steps(db, build_id, log_root, builder, fs_number,
+                                     session, repo, rep_job)
+            except Exception:
+                log.exception("  Failed to store gha_steps for %s #%d", builder, run_number)
+
         new_builds += 1
 
     return new_builds
