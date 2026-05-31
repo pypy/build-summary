@@ -1226,20 +1226,16 @@ def longrepr(build_id, test_name):
 def branch(name):
     """Paginated build history for all builders on one branch, with a comparison shortcut."""
     db = get_db()
-    before = request.args.get("before", type=float)
+    sort = request.args.get("sort", "started")
+    page = request.args.get("page", 1, type=int)
+    offset = (page - 1) * PAGE_SIZE
 
-    if before:
-        rows = db.execute(
-            "SELECT id, builder, number, revision, started, finished, result, source FROM builds"
-            " WHERE branch = ? AND started < ? ORDER BY started DESC LIMIT ?",
-            (name, before, PAGE_SIZE + 1),
-        ).fetchall()
-    else:
-        rows = db.execute(
-            "SELECT id, builder, number, revision, started, finished, result, source FROM builds"
-            " WHERE branch = ? ORDER BY started DESC LIMIT ?",
-            (name, PAGE_SIZE + 1),
-        ).fetchall()
+    order = "builder, started DESC" if sort == "builder" else "started DESC, builder"
+    rows = db.execute(
+        "SELECT id, builder, number, revision, started, finished, result, source FROM builds"
+        f" WHERE branch = ? ORDER BY {order} LIMIT ? OFFSET ?",
+        (name, PAGE_SIZE + 1, offset),
+    ).fetchall()
 
     has_older = len(rows) > PAGE_SIZE
     builds = rows[:PAGE_SIZE]
@@ -1258,8 +1254,12 @@ def branch(name):
             "css": RESULT_CSS.get(b["result"], "running" if b["finished"] is None else ""),
         })
 
-    older_url = f"/branch/{name}?before={builds[-1]['started']}" if has_older and builds else None
-    newer_url = f"/branch/{name}" if before else None
+    def page_url(p, s=sort):
+        base = f"/branch/{name}?sort={s}"
+        return base if p == 1 else f"{base}&page={p}"
+
+    older_url = page_url(page + 1) if has_older else None
+    newer_url = page_url(page - 1) if page > 1 else None
 
     primary_branches = get_primary_branches()
 
@@ -1267,6 +1267,7 @@ def branch(name):
         "branch.html",
         branch=name,
         builds=builds_data,
+        sort=sort,
         older_url=older_url,
         newer_url=newer_url,
         primary_branches=[b for b in primary_branches if b != name],

@@ -14,7 +14,13 @@
 </form>
 {% endif %}
 <table class="results">
-<tr><th>Build</th><th>Revision</th><th>Builder</th><th>Started</th><th>Result</th></tr>
+<tr>
+  <th>Build</th>
+  <th>Revision</th>
+  <th><a href="?sort=builder">Builder</a>{% if sort == 'builder' %} ▲{% endif %}</th>
+  <th><a href="?sort=started">Started</a>{% if sort != 'builder' %} ▲{% endif %}</th>
+  <th>Result</th>
+</tr>
 {% for b in builds %}
 <tr>
   <td><a href="/builders/{{ b.builder }}/builds/{{ b.number }}">{{ b.number }}</a></td>

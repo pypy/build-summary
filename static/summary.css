@@ -151,3 +151,16 @@ li { padding: 0.1em 1em; }
 .result { padding: 0.3em 1em; }
 table.results th { text-align: right; padding-right: 0.5em; }
 table.results td { padding: 0.1em 0.5em; }
+
+/* Zebra striping and hover for data tables */
+table.results tr:nth-child(even),
+table.builds tr:nth-child(even),
+table.info tr:nth-child(even) {
+    background-color: #ebebeb;
+}
+
+table.results tr:hover:not(:has(th)),
+table.builds tr:hover:not(:has(th)),
+table.info tr:hover:not(:has(th)) {
+    background-color: #cce4ff;
+}
