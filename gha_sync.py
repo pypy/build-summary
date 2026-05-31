@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import sys
 import time
 import zipfile
 
@@ -516,7 +517,7 @@ def main():
 
     token = _get_token()
     if not token:
-        log.warning("No GitHub token found; unauthenticated requests have low rate limits")
+        sys.exit("Error: no GitHub token found. Set GITHUB_TOKEN or authenticate with `gh auth login`.")
 
     since_ts = time.time() - args.days * 86400 if args.days else None
     os.makedirs(args.log_root, exist_ok=True)
