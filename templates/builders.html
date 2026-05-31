@@ -8,9 +8,9 @@
 <tr>
   <td class="left"><a href="/builders/{{ b.name }}">{{ b.name }}</a></td>
   <td class="left">{{ b.category }}</td>
-  <td>{% if b.main_number != '—' %}<a href="/builders/{{ b.name }}/builds/{{ b.main_number }}">{{ b.main_number }}</a>{% else %}—{% endif %}</td>
+  <td>{% if b.main_number != '—' %}<a href="/builders/{{ b.name }}/builds/{{ b.main_number_display }}">{{ b.main_number_display }}</a>{% else %}—{% endif %}</td>
   <td class="result {{ b.main_css }}">{{ b.main_text }}</td>
-  <td>{% if b.py311_number != '—' %}<a href="/builders/{{ b.name }}/builds/{{ b.py311_number }}">{{ b.py311_number }}</a>{% else %}—{% endif %}</td>
+  <td>{% if b.py311_number != '—' %}<a href="/builders/{{ b.name }}/builds/{{ b.py311_number_display }}">{{ b.py311_number_display }}</a>{% else %}—{% endif %}</td>
   <td class="result {{ b.py311_css }}">{{ b.py311_text }}</td>
 </tr>
 {% endfor %}

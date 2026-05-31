@@ -14,11 +14,12 @@
 </form>
 {% endif %}
 <table class="results">
-<tr><th>Revision</th><th>Builder</th><th>Started</th><th>Result</th></tr>
+<tr><th>Build</th><th>Revision</th><th>Builder</th><th>Started</th><th>Result</th></tr>
 {% for b in builds %}
 <tr>
+  <td><a href="/builders/{{ b.builder }}/builds/{{ b.number }}">{{ b.number }}</a></td>
   <td>{% if b.rev_url %}<a href="{{ b.rev_url }}">{{ b.revision }}</a>{% else %}{{ b.revision }}{% endif %}</td>
-  <td><a href="/builders/{{ b.builder }}/builds/{{ b.number }}">{{ b.builder }}</a></td>
+  <td><a href="/builders/{{ b.builder }}">{{ b.builder }}</a></td>
   <td>{{ b.started_fmt }}</td>
   <td class="result {{ b.css }}">{{ b.result_text }}</td>
 </tr>

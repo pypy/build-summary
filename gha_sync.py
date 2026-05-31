@@ -347,7 +347,7 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
         upsert_builder(db, builder, category)
 
         already = db.execute(
-            "SELECT 1 FROM builds WHERE builder=? AND number=?", (builder, run_number)
+            "SELECT 1 FROM builds WHERE builder=? AND number=? AND source='gha'", (builder, run_number)
         ).fetchone()
         if already and not reprocess:
             log.debug("  %s #%d already synced", builder, run_number)

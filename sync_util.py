@@ -69,6 +69,36 @@ def migrate_db(db):
         """)
         db.execute("PRAGMA user_version = 3")
         db.commit()
+    if version < 4:
+        # Change UNIQUE(builder, number) → UNIQUE(builder, number, source) to allow
+        # GHA and buildbot builds with the same number on the same builder.
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("""
+            CREATE TABLE builds_new (
+                id         INTEGER PRIMARY KEY,
+                builder    TEXT    NOT NULL REFERENCES builders(name),
+                number     INTEGER NOT NULL,
+                revision   TEXT,
+                branch     TEXT,
+                started    REAL,
+                finished   REAL,
+                result     INTEGER,
+                slave      TEXT,
+                reason     TEXT,
+                tests_pass INTEGER,
+                source     TEXT,
+                UNIQUE(builder, number, source)
+            )
+        """)
+        db.execute("INSERT INTO builds_new SELECT * FROM builds")
+        db.execute("DROP TABLE builds")
+        db.execute("ALTER TABLE builds_new RENAME TO builds")
+        db.execute("""CREATE INDEX IF NOT EXISTS builds_builder_branch_finished
+                      ON builds(builder, branch, finished)""")
+        db.execute("CREATE INDEX IF NOT EXISTS builds_revision ON builds(revision)")
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA user_version = 4")
+        db.commit()
 
 # sync_state key prefix for last-checked timestamps of empty runs
 _CHECKED_PREFIX = "_checked_"

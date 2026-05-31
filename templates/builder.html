@@ -17,7 +17,7 @@
 {% for b in builds %}
 <tr>
   <td><a href="/builders/{{ builder }}/builds/{{ b.number }}">{{ b.number }}</a></td>
-  <td>{% if b.revision %}<a href="/revision/{{ b.revision }}">{{ b.revision }}</a>{% endif %}</td>
+  <td>{% if b.revision %}<a href="/revision/{{ b.rev_hash }}">{{ b.revision }}</a>{% endif %}</td>
   <td>{{ b.branch }}</td>
   <td>{{ b.started_fmt }}</td>
   <td>{{ b.duration }}</td>

@@ -411,6 +411,11 @@ def _display_rev(rev_str, source=None):
     return h + _SOURCE_MARKER[source] if source in _SOURCE_MARKER else h
 
 
+def _display_number(number, source):
+    """Build number with source marker appended (e.g. 627*, 279+)."""
+    return f"{number}{_SOURCE_MARKER.get(source, '')}"
+
+
 def _lookup_outcome(outcomes, test_name):
     """Look up outcome for test_name, with prefix fallback.
 
@@ -663,7 +668,7 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT, compare=Fal
         revisions = [rev_meta[r] for r in revisions_sorted if r in rev_meta]
         n = len(revisions)
 
-        bid_to_number = {b["id"]: b["number"] for b in group_builds}
+        bid_to_number = {b["id"]: _display_number(b["number"], b["source"]) for b in group_builds}
 
         # bid_to_builder[build_id] = builder_short
         bid_to_builder = {}
@@ -886,29 +891,33 @@ def builders():
 
     def last_build_for_branch(builder_name, branch):
         r = db.execute(
-            """SELECT number, result, finished FROM builds
+            """SELECT number, result, finished, source FROM builds
                WHERE builder = ? AND branch = ?
                ORDER BY started DESC LIMIT 1""",
             (builder_name, branch),
         ).fetchone()
         if r is None:
-            return "—", "", ""
+            return "—", "—", "", ""
+        num = r["number"]
+        num_display = _display_number(num, r["source"])
         if r["finished"] is None:
-            return r["number"], "running", "running"
-        return r["number"], RESULT_TEXT.get(r["result"], "—"), RESULT_CSS.get(r["result"], "")
+            return num, num_display, "running", "running"
+        return num, num_display, RESULT_TEXT.get(r["result"], "—"), RESULT_CSS.get(r["result"], "")
 
     builders_data = []
     for r in rows:
-        main_num, main_text, main_css = last_build_for_branch(r["name"], "main")
-        py311_num, py311_text, py311_css = last_build_for_branch(r["name"], "py3.11")
+        main_num, main_num_display, main_text, main_css = last_build_for_branch(r["name"], "main")
+        py311_num, py311_num_display, py311_text, py311_css = last_build_for_branch(r["name"], "py3.11")
         builders_data.append(
             {
                 "name": r["name"],
                 "category": r["category"],
                 "main_number": main_num,
+                "main_number_display": main_num_display,
                 "main_text": main_text,
                 "main_css": main_css,
                 "py311_number": py311_num,
+                "py311_number_display": py311_num_display,
                 "py311_text": py311_text,
                 "py311_css": py311_css,
             }
@@ -978,10 +987,13 @@ def builder(name):
     for b in builds:
         raw_rev = b["revision"] or ""
         display_rev = _display_rev(raw_rev, b["source"]) if raw_rev else ""
+        rev_hash = raw_rev.split(":", 1)[-1] if ":" in raw_rev else raw_rev
+        number_display = _display_number(b["number"], b["source"])
         builds_data.append(
             {
-                "number": b["number"],
+                "number": number_display,
                 "revision": display_rev,
+                "rev_hash": rev_hash,
                 "branch": b["branch"] or "",
                 "started_fmt": fmt_time(b["started"]),
                 "duration": fmt_duration(b["started"], b["finished"]),
@@ -1009,30 +1021,37 @@ def builder(name):
     )
 
 
-@app.route("/builders/<name>/builds/<int:number>")
-def build(name, number):
+_BUILD_NUM_RE = re.compile(r'^(\d+)([*+]?)$')
+_SUFFIX_TO_SOURCE = {'*': ("source='gha'", []), '+': ("source IN ('bb','bb-master')", [])}
+
+@app.route("/builders/<name>/builds/<number_str>")
+def build(name, number_str):
     """Detail page for a single build: steps, logs, test outcomes."""
+    m = _BUILD_NUM_RE.match(number_str)
+    if not m:
+        abort(404)
+    number = int(m.group(1))
+    suffix = m.group(2)
     db = get_db()
-    b = db.execute(
-        "SELECT id, revision, branch, started, finished, result, slave, reason, source FROM builds"
-        " WHERE builder = ? AND number = ?",
-        (name, number),
-    ).fetchone()
-    if not b:
-        bounds = db.execute(
-            "SELECT MIN(number) AS lo, MAX(number) AS hi FROM builds WHERE builder = ?", (name,)
+    if suffix:
+        src_clause, src_params = _SUFFIX_TO_SOURCE[suffix]
+        b = db.execute(
+            f"SELECT id, revision, branch, started, finished, result, slave, reason, source FROM builds"
+            f" WHERE builder = ? AND number = ? AND {src_clause}",
+            [name, number] + src_params,
         ).fetchone()
-        lo, hi = (bounds["lo"], bounds["hi"]) if bounds else (None, None)
-        if lo is None:
-            msg = f"Builder {name!r} not found."
-        elif number > hi:
-            msg = (f"Build #{number} not found for {name}. "
-                   f"Latest known: <a href='/builders/{name}/builds/{hi}'>#{hi}</a>.")
-        elif number < lo:
-            msg = (f"Build #{number} not found for {name}. "
-                   f"Earliest known: <a href='/builders/{name}/builds/{lo}'>#{lo}</a>.")
-        else:
-            msg = f"Build #{number} is missing from the database for {name}."
+    else:
+        # No suffix — find the build and redirect to canonical URL
+        b = db.execute(
+            "SELECT id, revision, branch, started, finished, result, slave, reason, source FROM builds"
+            " WHERE builder = ? AND number = ? LIMIT 1",
+            (name, number),
+        ).fetchone()
+        if b:
+            from flask import redirect
+            return redirect(f"/builders/{name}/builds/{_display_number(number, b['source'])}")
+    if not b:
+        msg = f"Build #{number_str} not found for builder {name!r}."
         return f"<p>{msg}</p>", 404
 
     cat_row = db.execute("SELECT category FROM builders WHERE name = ?", (name,)).fetchone()
@@ -1140,7 +1159,7 @@ def build(name, number):
 
     return render_template(
         "build.html",
-        builder=name, number=number,
+        builder=name, number=number_str,
         revision=display_rev, branch=branch,
         rev_url=f"/revision/{display_rev}" if display_rev else "",
         branch_url=f"/summary?branch={branch}" if branch else "",
@@ -1194,11 +1213,11 @@ def longrepr(build_id, test_name):
         abort(404)
 
     builder = _h.escape(build["builder"])
-    number = build["number"]
+    number_display = _display_number(build["number"], build["source"])
     title = _h.escape(test_name)
     body = f"""<h2><b>{title}</b></h2>
 <pre>{_h.escape(longrepr_text)}</pre>
-<pre style="border-top:1px solid"><a href="/builders/{builder}/builds/{number}">builder: {builder} build #{number}</a></pre>
+<pre style="border-top:1px solid"><a href="/builders/{builder}/builds/{number_display}">builder: {builder} build #{number_display}</a></pre>
 <pre>test: {_h.escape(test_name)}</pre>"""
     return render_template("longrepr.html", page_title=test_name, body=body)
 
@@ -1231,7 +1250,7 @@ def branch(name):
         display_rev = _display_rev(raw_rev, b["source"]) if raw_rev else ""
         builds_data.append({
             "builder": b["builder"],
-            "number": b["number"],
+            "number": _display_number(b["number"], b["source"]),
             "revision": display_rev,
             "rev_url": f"/revision/{_display_rev(raw_rev)}" if raw_rev else "",
             "started_fmt": fmt_time(b["started"]),
@@ -1322,10 +1341,9 @@ def revision(sha):
     builds_data = [
         {
             "builder": b["builder"],
-            "source": b["source"],
             "source_marker": _SOURCE_MARKER.get(b["source"], ""),
             "category": b["category"],
-            "number": b["number"],
+            "number": _display_number(b["number"], b["source"]),
             "branch": b["branch"] or "",
             "started_fmt": fmt_time(b["started"]),
             "duration": fmt_duration(b["started"], b["finished"]),
@@ -1520,7 +1538,7 @@ def _build_summary_for_file(db, builder_name, revision, branch, row_class):
         return '', row_class
     # revision stored as "NNNNNN:HASH" or just number
     row = db.execute(
-        """SELECT id, number, result, tests_pass FROM builds
+        """SELECT id, number, source, result, tests_pass FROM builds
            WHERE builder = ? AND revision = ? AND branch = ?
            ORDER BY number DESC LIMIT 1""",
         (builder_name, revision, branch),
@@ -1529,7 +1547,7 @@ def _build_summary_for_file(db, builder_name, revision, branch, row_class):
         return '', row_class
     result = row['result']
     tests_pass = row['tests_pass']
-    build_url = f"/builders/{builder_name}/builds/{row['number']}"
+    build_url = f"/builders/{builder_name}/builds/{_display_number(row['number'], row['source'])}"
     if result == 0:
         css = row_class + '-passed'
         label = f"{tests_pass} passed" if tests_pass else "ok"
