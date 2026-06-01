@@ -1627,10 +1627,8 @@ def _nightly_index():
             size = 0
         branches.append({'name': name, 'date': date, 'size': _format_size(size)})
 
-    def _branch_key(b):
-        return (0 if b['name'] in ('trunk', 'main') else 1, b['name'])
-
-    branches.sort(key=_branch_key)
+    branches.sort(key=lambda b: b['date'], reverse=True)
+    branches.sort(key=lambda b: 0 if b['name'] in ('trunk', 'main') else 1)
     return branches
 
 
