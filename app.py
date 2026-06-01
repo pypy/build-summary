@@ -859,6 +859,31 @@ def summary():
 
     outcomes_by_build = {bid: _get_outcomes(bid) for bid in build_ids}
 
+    # For builds that failed with no test outcomes, inject the failing step text
+    # as a synthetic outcome so the failure is visible in the matrix.
+    failed_no_tests = [b for b in builds if b["result"] in (2, 4) and not outcomes_by_build.get(b["id"])]
+    if failed_no_tests:
+        fids = [b["id"] for b in failed_no_tests]
+        ph = ",".join("?" * len(fids))
+        bb_failed = {}
+        for row in db.execute(
+            f"SELECT build_id, name, text FROM steps WHERE build_id IN ({ph}) AND result IN (2,4)"
+            " ORDER BY build_id, step_number", fids
+        ):
+            label = row["text"] or row["name"]
+            if label:
+                bb_failed.setdefault(row["build_id"], []).append(label)
+        gha_failed = {}
+        for row in db.execute(
+            f"SELECT build_id, name FROM gha_steps WHERE build_id IN ({ph}) AND result IN (2,4)"
+            " ORDER BY build_id, step_number", fids
+        ):
+            gha_failed.setdefault(row["build_id"], []).append(row["name"])
+        for b in failed_no_tests:
+            bid = b["id"]
+            labels = bb_failed.get(bid) or gha_failed.get(bid) or ["build failed"]
+            outcomes_by_build[bid] = {label: "!" for label in labels}
+
     sections = build_sections(builds, outcomes_by_build, max_revs=max_revs, compare=len(revisions) > 1)
 
     last_build_date = None
@@ -1207,6 +1232,7 @@ def longrepr(build_id, test_name):
     if not build:
         abort(404)
 
+    number_display = _display_number(build["number"], build["source"])
     longrepr_text = None
     prefix = test_name + "::"
     for path in _pytestlog_paths(build_id):
@@ -1232,7 +1258,6 @@ def longrepr(build_id, test_name):
         abort(404)
 
     builder = _h.escape(build["builder"])
-    number_display = _display_number(build["number"], build["source"])
     title = _h.escape(test_name)
     body = f"""<h2><b>{title}</b></h2>
 <pre>{_h.escape(longrepr_text)}</pre>
