@@ -12,6 +12,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 from importlib.metadata import version as pkg_version
 
@@ -508,9 +509,12 @@ def _get_outcomes(build_id):
         except OSError:
             continue
         parse = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
-        for name, outcome, _ in parse(text):
-            if _OUTCOME_PRIORITY.get(outcome, 0) > _OUTCOME_PRIORITY.get(combined.get(name), -1):
-                combined[name] = outcome
+        try:
+            for name, outcome, _ in parse(text):
+                if _OUTCOME_PRIORITY.get(outcome, 0) > _OUTCOME_PRIORITY.get(combined.get(name), -1):
+                    combined[name] = outcome
+        except ET.ParseError:
+            continue
     return combined
 
 
