@@ -1713,7 +1713,7 @@ def serve_nightly_file(branch, filename):
     return redirect(f"{BUILDBOT_URL}/nightly/{branch}/{filename}", code=302)
 
 
-_BENCH_FILE_RE = re.compile(r'^(\d+)-([0-9a-f]+)-64(-[^.]+)?\.json$')
+_BENCH_FILE_RE = re.compile(r'^(\d+)[-:]([0-9a-f]+)-64(-[^.]+)?\.json$')
 
 # Machine name (from filename suffix, or "benchmarker" when absent) → builder name.
 _MACHINE_TO_BUILDER = {
