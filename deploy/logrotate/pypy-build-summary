@@ -1,0 +1,11 @@
+/home/pypy-worker/build-summary/logs/buildbot_sync.log
+/home/pypy-worker/build-summary/logs/gha_sync.log
+{
+    weekly
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    su pypy-worker pypy-worker
+}

@@ -170,6 +170,11 @@ The actual jobs:
 */5 * * * * cd /home/pypy-worker/build-summary && . /home/pypy-worker/.env && /home/pypy-worker/venv313/bin/python gha_sync.py >> logs/gha_sync.log 2>&1
 ```
 
+These two files grow unbounded (cron just appends), so they're rotated via
+`deploy/logrotate/pypy-build-summary`, installed as
+`/etc/logrotate.d/pypy-build-summary` (weekly, keeps 2 rotations ≈ last 14 days,
+compressed).
+
 Notes / gotchas:
 
 - The **GitHub token lives in `/home/pypy-worker/.env`**, which the GHA job
