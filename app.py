@@ -417,6 +417,14 @@ def short_builder(name):
     return name
 
 
+_BUILDER_ORDER = {"rpy": 0, "own": 1, "jit": 2}
+
+
+def _builder_sort_key(bshort):
+    """Display order: rpy, own, jit, then anything else alphabetically."""
+    return (_BUILDER_ORDER.get(bshort, len(_BUILDER_ORDER)), bshort)
+
+
 # ---------------------------------------------------------------------------
 # Summary matrix logic
 # ---------------------------------------------------------------------------
@@ -576,7 +584,7 @@ def render_section_pre(
         rev_link = f'<a href="{rev["rev_url"]}">{_html.escape(display)}</a>'
         padding = " " * (align - 2 * i - 1 - len(display))
         builder_parts = []
-        for bshort in sorted(all_builders):
+        for bshort in sorted(all_builders, key=_builder_sort_key):
             bid = builds_by_rev_builder.get(rev_str, {}).get(bshort)
             if bid is None:
                 continue
@@ -719,7 +727,8 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT, compare=Fal
 
         matrix_rows = []
         for (bshort, tname), worst in sorted(
-            error_keys.items(), key=lambda kv: (0 if kv[1] == "!" else 1, kv[0])
+            error_keys.items(),
+            key=lambda kv: (0 if kv[1] == "!" else 1, _builder_sort_key(kv[0][0]), kv[0][1]),
         ):
             combination = 0
             for i, rev in enumerate(revisions):
@@ -906,9 +915,10 @@ def summary():
         if branch:
             max_query += " AND b.branch = ?"
             max_params.append(branch)
-        if prefix:
-            max_query += " AND b.builder LIKE ?"
-            max_params.append(prefix + "%")
+        if prefixes:
+            max_query += " AND (" + " OR ".join("b.builder LIKE ?" for _ in prefixes) + ")"
+            for p in prefixes:
+                max_params.append(p + "%")
         row = db.execute(max_query, max_params).fetchone()
         if row and row["ts"]:
             last_build_date = fmt_time(row["ts"])

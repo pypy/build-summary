@@ -373,8 +373,14 @@ def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None
             build_data = bb_get(f"/json/builders/{builder}/builds/{number}")
             finished = process_build(db, log_root, builder, build_data, skip_logs=skip_logs)
             if finished:
-                new_last = max(new_last, number)
                 count += 1
+                # Only advance the watermark through a contiguous run of finished
+                # builds. A later-numbered build finishing first (e.g. a faster
+                # build on a different branch) must not skip past an earlier one
+                # that's still running - discover_new_builds() stops at the
+                # watermark, so skipping here would orphan it permanently.
+                if number == new_last + 1:
+                    new_last = number
         except Exception:
             log.exception("%s #%d failed", builder, number)
 
