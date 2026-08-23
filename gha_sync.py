@@ -536,6 +536,7 @@ def main():
 
     token = _get_token()
     if not token:
+        log.error("Error: no GitHub token found. Set GITHUB_TOKEN or authenticate with `gh auth login`.")
         sys.exit("Error: no GitHub token found. Set GITHUB_TOKEN or authenticate with `gh auth login`.")
 
     since_ts = time.time() - args.days * 86400 if args.days else None

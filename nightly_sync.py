@@ -37,6 +37,7 @@ def list_branch(branch):
     url = f"{BUILDBOT_URL}/nightly/{branch}/"
     r = requests.get(url, timeout=REQUEST_TIMEOUT)
     if r.status_code == 404:
+        log.info(f"url '{url}' not found")
         return []
     r.raise_for_status()
     dated = []
@@ -158,7 +159,7 @@ def update_symlinks(branch_dir):
 def sync_branch(branch, nightly_root, cutoff, run=None, dry_run=False, source_root=None):
     dated = list_branch(branch)
     if not dated:
-        log.debug("branch %s: no files", branch)
+        log.error("branch %s: no files", branch)
         return
 
     # Group dated files by (revnum, hash), filter by date
