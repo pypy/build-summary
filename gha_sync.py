@@ -112,12 +112,17 @@ def _gh_get(session, url, **params):
     return r.json()
 
 
-def iter_completed_runs(session, repo, workflow_file, last_run_id, since_ts=None):
-    """Yield run dicts with run_id > last_run_id, newest first, stopping early."""
+def iter_new_runs(session, repo, workflow_file, last_run_id, since_ts=None):
+    """Yield run dicts of any status with run_id > last_run_id, newest first, stopping early.
+
+    Includes in-progress/queued runs (not just completed ones) so the caller can
+    detect a lower-id run that hasn't finished yet and hold the watermark back for
+    it, instead of a later-id run that completes first silently orphaning it.
+    """
     url = f"{GITHUB_API}/repos/{repo}/actions/workflows/{workflow_file}/runs"
     page = 1
     while True:
-        data = _gh_get(session, url, status="completed", per_page=50, page=page)
+        data = _gh_get(session, url, per_page=50, page=page)
         runs = data.get("workflow_runs", [])
         if not runs:
             break
@@ -463,7 +468,7 @@ def sync(db, log_root, session, repo, workflow_file, since_ts=None, reprocess=Fa
     log.info("GHA sync: repo=%s workflow=%s last_run_id=%d", repo, workflow_file, last_run_id)
 
     effective_last = 0 if reprocess else last_run_id
-    new_runs = list(iter_completed_runs(session, repo, workflow_file, effective_last, since_ts=since_ts))
+    new_runs = list(iter_new_runs(session, repo, workflow_file, effective_last, since_ts=since_ts))
     if not new_runs:
         log.info("Nothing new")
         return 0
@@ -471,14 +476,28 @@ def sync(db, log_root, session, repo, workflow_file, since_ts=None, reprocess=Fa
     new_runs.reverse()  # process oldest first so last_run_id advances monotonically
     total = 0
     max_run_id = last_run_id
+    # Only advance the watermark through a contiguous run of *completed* runs.
+    # A later-id run finishing before an earlier one (still queued/in_progress)
+    # must not skip the watermark past it - iter_new_runs() stops at the
+    # watermark, so skipping here would orphan the earlier run permanently once
+    # it does finish.
+    blocked = False
     for run in new_runs:
+        if run.get("status") != "completed":
+            log.info("Run #%s (id=%d) not completed yet (status=%s); holding watermark",
+                      run.get("run_number"), run["id"], run.get("status"))
+            blocked = True
+            continue
         try:
             n = process_run(db, log_root, session, repo, run, reprocess=reprocess)
             total += n
-            max_run_id = max(max_run_id, run["id"])
             db.commit()
         except Exception:
             log.exception("Failed to process run %d", run["id"])
+            blocked = True
+            continue
+        if not blocked:
+            max_run_id = max(max_run_id, run["id"])
 
     if max_run_id > last_run_id:
         set_last_build(db, state_key, max_run_id)
