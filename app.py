@@ -1344,32 +1344,35 @@ def compare_branch():
     if not branch_a or not branch_b:
         abort(400)
 
-    def latest_rev_and_builders(branch):
-        """Return (display_rev, {builders}) using the most recent revision but
-        all builders that have ever run on this branch."""
-        row = db.execute(
-            "SELECT revision FROM builds WHERE branch = ? AND revision IS NOT NULL"
-            " AND finished IS NOT NULL ORDER BY started DESC LIMIT 1",
-            (branch,),
-        ).fetchone()
-        if not row:
-            return None, set()
-        builders = {
+    def builders_for(branch):
+        return {
             r["builder"] for r in db.execute(
                 "SELECT DISTINCT builder FROM builds WHERE branch = ?",
                 (branch,),
             ).fetchall()
         }
-        return _display_rev(row["revision"]), builders
 
-    rev_a, builders_a = latest_rev_and_builders(branch_a)
-    rev_b, builders_b = latest_rev_and_builders(branch_b)
-
-    if not rev_a or not rev_b:
+    common = builders_for(branch_a) & builders_for(branch_b)
+    if not common:
         abort(404)
 
-    common = builders_a & builders_b
-    if not common:
+    def latest_rev(branch):
+        """Most recent revision on this branch tested by one of the builders
+        common to both branches — e.g. avoids picking a GHA-only revision when
+        the other branch is only tracked by buildbot builders, or vice versa."""
+        placeholders = ",".join("?" * len(common))
+        row = db.execute(
+            "SELECT revision FROM builds WHERE branch = ? AND revision IS NOT NULL"
+            f" AND finished IS NOT NULL AND builder IN ({placeholders})"
+            " ORDER BY started DESC LIMIT 1",
+            (branch, *common),
+        ).fetchone()
+        return _display_rev(row["revision"]) if row else None
+
+    rev_a = latest_rev(branch_a)
+    rev_b = latest_rev(branch_b)
+
+    if not rev_a or not rev_b:
         abort(404)
 
     params = [("revision", rev_a), ("revision", rev_b)]
