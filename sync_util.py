@@ -203,13 +203,13 @@ class SyncRun:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        logging.getLogger().removeHandler(self._handler)
         now = time.time()
         status = 'error' if exc_type else 'ok'
         if exc_type:
             logging.getLogger(self.script).error(
                 "Unhandled exception: %s", traceback.format_exc()
             )
+        logging.getLogger().removeHandler(self._handler)
 
         if status == 'ok' and self.items_synced == 0:
             # Empty successful run — skip the sync_runs row, just update last_checked
