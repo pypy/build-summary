@@ -30,7 +30,7 @@ from buildbot_sync import (
     set_last_build,
     upsert_builder,
 )
-from sync_util import DB_PATH, LOG_ROOT, SyncRun
+from sync_util import DB_PATH, LOG_ROOT, LockHeld, SyncRun, single_instance_lock
 
 GITHUB_API = "https://api.github.com"
 REQUEST_TIMEOUT = 30
@@ -542,15 +542,20 @@ def main():
     since_ts = time.time() - args.days * 86400 if args.days else None
     os.makedirs(args.log_root, exist_ok=True)
 
-    with SyncRun("gha", args.db) as run:
-        db = open_db(args.db)
-        session = _session(token)
-        start = time.time()
-        n = sync(db, args.log_root, session, args.repo, args.workflow_file, since_ts=since_ts,
-                 reprocess=args.reprocess)
-        run.items_synced = n
-        log.info("Finished in %.1fs", time.time() - start)
-        db.close()
+    try:
+        with single_instance_lock("gha_sync"):
+            with SyncRun("gha", args.db) as run:
+                db = open_db(args.db)
+                session = _session(token)
+                start = time.time()
+                n = sync(db, args.log_root, session, args.repo, args.workflow_file, since_ts=since_ts,
+                         reprocess=args.reprocess)
+                run.items_synced = n
+                log.info("Finished in %.1fs", time.time() - start)
+                db.close()
+    except LockHeld as e:
+        log.warning(str(e))
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

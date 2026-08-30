@@ -9,6 +9,8 @@ Usage in a sync script:
         run.bytes_fetched += len(data)
 """
 
+import contextlib
+import fcntl
 import io
 import logging
 import os
@@ -24,11 +26,38 @@ BUILDBOT_MASTER_ROOT = os.path.expanduser(os.environ.get("BUILDBOT_MASTER_ROOT",
 OUTPUT_LIMIT = 64 * 1024  # truncate captured log at 64 KB
 
 
+class LockHeld(RuntimeError):
+    """Another instance already holds the single_instance_lock."""
+
+
+@contextlib.contextmanager
+def single_instance_lock(name):
+    """
+    Fail fast with LockHeld if another instance of `name` is already running,
+    instead of blocking -- so an overlapping cron run exits immediately
+    rather than queuing up behind a slow one.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f".{name}.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise LockHeld(f"{name} is already running (lock held on {path})")
+    try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def migrate_db(db):
     """Apply incremental schema migrations. Safe to call on every DB open."""
     version = db.execute("PRAGMA user_version").fetchone()[0]
     if version < 1:
-        db.execute("ALTER TABLE builds ADD COLUMN source TEXT")
+        cols = [row[1] for row in db.execute("PRAGMA table_info(builds)").fetchall()]
+        if "source" not in cols:
+            db.execute("ALTER TABLE builds ADD COLUMN source TEXT")
         db.execute("""
             UPDATE builds SET source = CASE
                 WHEN revision LIKE '%:%' THEN 'bb'

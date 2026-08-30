@@ -22,7 +22,7 @@ except ImportError:
     import zstandard as _zstd
     def _zstd_compress(data): return _zstd.ZstdCompressor().compress(data)
 
-from sync_util import DB_PATH, LOG_ROOT, SyncRun, migrate_db
+from sync_util import DB_PATH, LOG_ROOT, LockHeld, SyncRun, migrate_db, single_instance_lock
 
 BUILDBOT_URL = "https://buildbot.pypy.org"
 REQUEST_TIMEOUT = 30
@@ -472,8 +472,12 @@ def poll_all(db, log_root, skip_logs=False, since_ts=None, master_root=None):
     stats = {}
     for builder, info in builders.items():
         category = info.get("category", "")
-        count = poll_builder(db, log_root, builder, category,
-                             skip_logs=skip_logs, since_ts=since_ts, master_root=master_root)
+        try:
+            count = poll_builder(db, log_root, builder, category,
+                                 skip_logs=skip_logs, since_ts=since_ts, master_root=master_root)
+        except Exception:
+            log.exception("%s: poll failed", builder)
+            continue
         if count:
             stats[builder] = count
     return stats
@@ -517,22 +521,27 @@ def main():
 
     os.makedirs(args.log_root, exist_ok=True)
 
-    with SyncRun("buildbot", args.db) as run:
-        db = open_db(args.db)
-        start = time.time()
-        before = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
-        stats = poll_all(db, args.log_root, skip_logs=skip_logs, since_ts=since_ts,
-                         master_root=args.master_root or None)
-        after = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
-        run.items_synced = after - before
-        log.info("done in %.1fs (%d new finished builds)", time.time() - start, run.items_synced)
-        if stats:
-            col = max(len(b) for b in stats)
-            print(f"\n{'Builder':<{col}}  {'New builds':>10}")
-            print("-" * (col + 13))
-            for builder, count in sorted(stats.items()):
-                print(f"{builder:<{col}}  {count:>10}")
-        db.close()
+    try:
+        with single_instance_lock("buildbot_sync"):
+            with SyncRun("buildbot", args.db) as run:
+                db = open_db(args.db)
+                start = time.time()
+                before = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
+                stats = poll_all(db, args.log_root, skip_logs=skip_logs, since_ts=since_ts,
+                                 master_root=args.master_root or None)
+                after = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
+                run.items_synced = after - before
+                log.info("done in %.1fs (%d new finished builds)", time.time() - start, run.items_synced)
+                if stats:
+                    col = max(len(b) for b in stats)
+                    print(f"\n{'Builder':<{col}}  {'New builds':>10}")
+                    print("-" * (col + 13))
+                    for builder, count in sorted(stats.items()):
+                        print(f"{builder:<{col}}  {count:>10}")
+                db.close()
+    except LockHeld as e:
+        log.warning(str(e))
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
