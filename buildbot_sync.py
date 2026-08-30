@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import time
 
 import requests
@@ -209,6 +210,68 @@ def bb_get(path):
     return r.json()
 
 
+# ---------------------------------------------------------------------------
+# On-disk API: reads builder/build state directly from the master's own
+# pickles instead of going over HTTP. Both services run on the same host as
+# the same user, so this is just local file I/O -- it avoids putting a
+# request/accept/connection-teardown cycle on the buildmaster's aging
+# Twisted reactor for every build we poll.
+#
+# The pickled objects are old-style buildbot/twisted classes that only
+# unpickle correctly under the exact interpreter (and buildbot install)
+# that wrote them, so the actual reading happens in a bb_disk.py subprocess
+# run with the master's own interpreter (found via /proc/<pid>/exe), not
+# in this (Python 3) process.
+# ---------------------------------------------------------------------------
+
+BB_DISK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bb_disk.py")
+
+
+def _master_pypy_exe(master_root):
+    pidfile = os.path.join(master_root, "twistd.pid")
+    try:
+        with open(pidfile) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"can't read master pid from {pidfile}: {e}")
+    exe = f"/proc/{pid}/exe"
+    if not os.path.exists(exe):
+        raise RuntimeError(
+            f"buildbot master (pid {pid}, from {pidfile}) is not running; "
+            f"can't read its pickles under {master_root}"
+        )
+    return exe
+
+
+def _bb_disk(master_root, *args):
+    exe = _master_pypy_exe(master_root)
+    proc = subprocess.run(
+        [exe, BB_DISK_SCRIPT] + list(args),
+        capture_output=True, text=True, timeout=REQUEST_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"bb_disk.py {args} failed: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def list_builders_disk(master_root):
+    return _bb_disk(master_root, "builders", master_root)
+
+
+def discover_new_builds_disk(master_root, builder, last, since_ts=None):
+    numbers = sorted(_bb_disk(master_root, "builds", master_root, builder))
+    if since_ts is None:
+        return [n for n in numbers if n > last]
+    # --days backfill ignores the watermark; poll_builder filters by since_ts
+    # itself once it has each build's times (disk reads are cheap, so we
+    # don't need the HTTP path's paginated-by-recency trick here).
+    return numbers
+
+
+def get_build_disk(master_root, builder, number):
+    return _bb_disk(master_root, "build", master_root, builder, str(number))
+
+
 def fetch_log_text(builder, number, step, log_name):
     url = f"{BUILDBOT_URL}/builders/{builder}/builds/{number}/steps/{step}/logs/{log_name}/text"
     r = requests.get(url, timeout=REQUEST_TIMEOUT)
@@ -354,13 +417,16 @@ def discover_new_builds(builder, last, limit=INITIAL_BACKFILL, since_ts=None):
     return sorted(new)
 
 
-def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None):
+def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None, master_root=None):
     upsert_builder(db, builder, category)
     last = get_last_build(db, builder)
 
     # When backfilling by time, ignore the stored watermark so we can fill gaps
     discover_last = 0 if since_ts else last
-    builds_to_fetch = discover_new_builds(builder, discover_last, since_ts=since_ts)
+    if master_root:
+        builds_to_fetch = discover_new_builds_disk(master_root, builder, discover_last, since_ts=since_ts)
+    else:
+        builds_to_fetch = discover_new_builds(builder, discover_last, since_ts=since_ts)
     if not builds_to_fetch:
         log.debug("%s: nothing new (last=%d)", builder, last)
         return 0
@@ -370,7 +436,14 @@ def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None
     count = 0
     for number in builds_to_fetch:
         try:
-            build_data = bb_get(f"/json/builders/{builder}/builds/{number}")
+            if master_root:
+                build_data = get_build_disk(master_root, builder, number)
+                if since_ts is not None:
+                    started = (build_data.get("times") or [None])[0]
+                    if started is not None and started < since_ts:
+                        continue
+            else:
+                build_data = bb_get(f"/json/builders/{builder}/builds/{number}")
             finished = process_build(db, log_root, builder, build_data, skip_logs=skip_logs)
             if finished:
                 count += 1
@@ -391,13 +464,16 @@ def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None
     return count
 
 
-def poll_all(db, log_root, skip_logs=False, since_ts=None):
-    builders = bb_get("/json/builders/")
+def poll_all(db, log_root, skip_logs=False, since_ts=None, master_root=None):
+    if master_root:
+        builders = {b["name"]: b for b in list_builders_disk(master_root)}
+    else:
+        builders = bb_get("/json/builders/")
     stats = {}
     for builder, info in builders.items():
         category = info.get("category", "")
         count = poll_builder(db, log_root, builder, category,
-                             skip_logs=skip_logs, since_ts=since_ts)
+                             skip_logs=skip_logs, since_ts=since_ts, master_root=master_root)
         if count:
             stats[builder] = count
     return stats
@@ -414,8 +490,9 @@ def main():
     parser.add_argument("--log-root", default=LOG_ROOT,
                         help="Directory for log files (default: %(default)s)")
     parser.add_argument("--master-root", default="",
-                        help="Path to buildbot master directory; if set, skip downloading "
-                             "log files (they will be read directly from the master) (default: %(default)r)")
+                        help="Path to buildbot master directory; if set, read builder/build "
+                             "state directly from the master's on-disk pickles instead of "
+                             "over HTTP, and skip downloading log files (default: %(default)r)")
     parser.add_argument("--days", type=int, default=0,
                         help="Backfill builds from the past N days "
                              "(default: last %d per builder)" % INITIAL_BACKFILL)
@@ -433,7 +510,8 @@ def main():
         if not os.path.isdir(args.master_root):
             parser.error(f"--master-root {args.master_root!r} does not exist or is not a directory")
         skip_logs = True
-        log.info("master-root %s found; skipping log downloads", args.master_root)
+        log.info("master-root %s found; reading builder/build state from disk, skipping log downloads",
+                 args.master_root)
 
     since_ts = time.time() - args.days * 86400 if args.days else None
 
@@ -443,7 +521,8 @@ def main():
         db = open_db(args.db)
         start = time.time()
         before = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
-        stats = poll_all(db, args.log_root, skip_logs=skip_logs, since_ts=since_ts)
+        stats = poll_all(db, args.log_root, skip_logs=skip_logs, since_ts=since_ts,
+                         master_root=args.master_root or None)
         after = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
         run.items_synced = after - before
         log.info("done in %.1fs (%d new finished builds)", time.time() - start, run.items_synced)
