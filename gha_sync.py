@@ -25,6 +25,7 @@ from buildbot_sync import (
     insert_build,
     insert_log,
     open_db,
+    parse_pytest_log,
     save_log_file,
     save_pytest_log,
     set_last_build,
@@ -185,6 +186,11 @@ def suite_from_artifact_name(name):
     marker = "-testrun-log-"
     idx = name.find(marker)
     return name[:idx] if idx != -1 else None
+
+
+def _has_crash(testrun_text):
+    """True if the pytest log records any '!' outcome (crashed test file)."""
+    return any(outcome == "!" for _, outcome, _ in parse_pytest_log(testrun_text))
 
 
 def job_timing(jobs, suite, platform):
@@ -395,12 +401,23 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
                 if last_line:
                     detail += f": {last_line}"
                 testrun_text += f"\n! {suite}/timeout\n {detail}\n"
+            # A "!" outcome (crashed/timed-out test file) doesn't necessarily
+            # fail the GHA job, but it should never show as a green step.
+            if s_result == 0 and _has_crash(testrun_text):
+                s_result = 2
+                log.info("  %s: job succeeded but testrun.log has a crash; marking step FAILED", suite)
             merged_parts.append(testrun_text)
             suite_logs.append((suite, testrun_text, output_text, s_started, s_finished, s_result))
 
         if not merged_parts:
             log.warning("  No testrun.log for %s platform=%s", builder, platform)
             continue
+
+        # Roll a crash-induced step failure up into the build result too, so
+        # the build and combined step agree with the suite steps.
+        worst_step = max(s[5] for s in suite_logs)
+        if worst_step > result:
+            result = worst_step
 
         build_id = insert_build(
             db, builder, run_number, sha12, branch,

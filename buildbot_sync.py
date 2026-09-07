@@ -28,6 +28,11 @@ BUILDBOT_URL = "https://buildbot.pypy.org"
 REQUEST_TIMEOUT = 30
 # How many past builds to check per builder on first run
 INITIAL_BACKFILL = 15
+# A build still unfinished this long after it started is treated as abandoned
+# (worker crashed, master restarted, ...) so the watermark can move past it.
+# The same age also lets the watermark skip a build number that never
+# appeared on the master at all.
+STALE_BUILD_SECONDS = 10 * 3600
 
 log = logging.getLogger(__name__)
 
@@ -37,9 +42,12 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def open_db(path):
-    db = sqlite3.connect(path)
+    # 30s wait on a locked DB (default is 5s): buildbot_sync and gha_sync share
+    # the DB and a run of either can hold the write lock for ~20s.
+    db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=30000")
     db.execute("PRAGMA foreign_keys=ON")
     with open(os.path.join(os.path.dirname(__file__), "schema.sql")) as f:
         db.executescript(f.read())
@@ -432,36 +440,77 @@ def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None
         return 0
 
     log.info("%s: fetching builds %s", builder, builds_to_fetch)
-    new_last = last
     count = 0
+    started_at = {}   # number -> start time (None if unknown) for builds we read
+    finished_set = set()
+    errored = set()
     for number in builds_to_fetch:
         try:
             if master_root:
                 build_data = get_build_disk(master_root, builder, number)
-                if since_ts is not None:
-                    started = (build_data.get("times") or [None])[0]
-                    if started is not None and started < since_ts:
-                        continue
             else:
                 build_data = bb_get(f"/json/builders/{builder}/builds/{number}")
-            finished = process_build(db, log_root, builder, build_data, skip_logs=skip_logs)
-            if finished:
+            started = (build_data.get("times") or [None])[0]
+            if since_ts is not None and started is not None and started < since_ts:
+                continue
+            started_at[number] = started
+            if process_build(db, log_root, builder, build_data, skip_logs=skip_logs):
                 count += 1
-                # Only advance the watermark through a contiguous run of finished
-                # builds. A later-numbered build finishing first (e.g. a faster
-                # build on a different branch) must not skip past an earlier one
-                # that's still running - discover_new_builds() stops at the
-                # watermark, so skipping here would orphan it permanently.
-                if number == new_last + 1:
-                    new_last = number
+                finished_set.add(number)
         except Exception:
+            errored.add(number)
             log.exception("%s #%d failed", builder, number)
 
+    new_last = _advance_watermark(builder, last, started_at, finished_set, errored)
     if new_last > last:
         set_last_build(db, builder, new_last)
 
     db.commit()
     return count
+
+
+def _is_stale(started, now):
+    return started is not None and now - started > STALE_BUILD_SECONDS
+
+
+def _advance_watermark(builder, last, started_at, finished_set, errored, now=None):
+    """
+    Return the new watermark for `builder`.
+
+    Only advance through a contiguous run of *finished* builds. A later-numbered
+    build finishing first (e.g. a faster build on a different branch) must not
+    skip past an earlier one that's still running - discovery stops at the
+    watermark, so skipping here would orphan it permanently.
+
+    Two escape hatches so a single bad build can't freeze the builder forever:
+
+    - An unfinished build that started more than STALE_BUILD_SECONDS ago will
+      never finish (worker crashed, master restarted); move past it.
+    - A build number missing from the master (a gap) can be skipped once the
+      next existing build is itself that old - buildbot allocates numbers
+      sequentially, so nothing can still appear in the gap.
+
+    A build that raised while being processed always blocks, so it's retried.
+    """
+    if now is None:
+        now = time.time()
+    new_last = last
+    for number in sorted(started_at):
+        if number in errored:
+            break
+        started = started_at[number]
+        stale = _is_stale(started, now)
+        if number > new_last + 1 and not stale:
+            break   # gap before this build; wait until it's old enough to be sure
+        if number in finished_set:
+            new_last = number
+        elif stale:
+            log.warning("%s #%d unfinished for over %dh; giving up waiting for it",
+                        builder, number, STALE_BUILD_SECONDS // 3600)
+            new_last = number
+        else:
+            break
+    return new_last
 
 
 def poll_all(db, log_root, skip_logs=False, since_ts=None, master_root=None):
