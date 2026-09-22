@@ -163,6 +163,12 @@ service reads — most importantly the same `SUMMARY_DB`. If a sync job runs fro
 a different working directory without `SUMMARY_DB` set, it silently writes to a
 *different* `./pypy_summary.sqlite` and the site never sees the results.
 
+In `--master-root` mode `buildbot_sync.py` reads finished builds from the
+master's pickles, but a build in progress has no pickle yet, so once per run
+it also asks the master's own web port (`--master-url`, default
+`http://localhost:8099`, deliberately not the rate-limited public hostname)
+which builds are running and reads those over JSON.
+
 Inspect the actual schedule with:
 
 ```bash

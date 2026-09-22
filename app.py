@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 
 from importlib.metadata import version as pkg_version
 
-from buildbot_sync import parse_pytest_log, parse_xml_log
+from buildbot_sync import STALE_BUILD_SECONDS, parse_pytest_log, parse_xml_log
 from sync_util import get_last_checked
 
 try:
@@ -991,9 +991,34 @@ def summary():
 
 @app.route("/builders")
 def builders():
-    """List of all known builders with their latest results on main and py3.11."""
+    """List of all known builders: last activity, builds in progress, and the latest
+    result on each primary branch (main plus the active py3.x branches).
+    ?sort=time  — latest activity first (default)
+    ?sort=name  — alphabetical"""
     db = get_db()
+    sort = "name" if request.args.get("sort") == "name" else "time"
+    branches = get_primary_branches()
     rows = db.execute("SELECT name, category FROM builders ORDER BY name").fetchall()
+
+    last_started = {
+        r["builder"]: r["last"]
+        for r in db.execute("SELECT builder, MAX(started) AS last FROM builds GROUP BY builder")
+    }
+
+    # Unfinished builds young enough to still be running. Older ones were
+    # abandoned (worker crash, master restart) and would show forever.
+    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    running = {}
+    for r in db.execute(
+        "SELECT builder, number, source, branch, started FROM builds"
+        " WHERE finished IS NULL AND started > ? ORDER BY started DESC",
+        (now_ts - STALE_BUILD_SECONDS,),
+    ):
+        running.setdefault(r["builder"], []).append({
+            "number_display": _display_number(r["number"], r["source"]),
+            "branch": r["branch"] or "",
+            "started_fmt": fmt_time(r["started"]),
+        })
 
     def last_build_for_branch(builder_name, branch):
         r = db.execute(
@@ -1012,24 +1037,26 @@ def builders():
 
     builders_data = []
     for r in rows:
-        main_num, main_num_display, main_text, main_css = last_build_for_branch(r["name"], "main")
-        py311_num, py311_num_display, py311_text, py311_css = last_build_for_branch(r["name"], "py3.11")
+        per_branch = []
+        for br in branches:
+            num, num_display, text, css = last_build_for_branch(r["name"], br)
+            per_branch.append({"number": num, "number_display": num_display, "text": text, "css": css})
         builders_data.append(
             {
                 "name": r["name"],
                 "category": r["category"],
-                "main_number": main_num,
-                "main_number_display": main_num_display,
-                "main_text": main_text,
-                "main_css": main_css,
-                "py311_number": py311_num,
-                "py311_number_display": py311_num_display,
-                "py311_text": py311_text,
-                "py311_css": py311_css,
+                "last_started": last_started.get(r["name"]),
+                "last_started_fmt": fmt_time(last_started.get(r["name"])),
+                "running": running.get(r["name"], []),
+                "branches": per_branch,
             }
         )
 
-    return render_template("builders.html", builders=builders_data, page_title="Builders")
+    if sort == "time":
+        builders_data.sort(key=lambda b: -(b["last_started"] or 0))
+
+    return render_template("builders.html", builders=builders_data, branches=branches,
+                           sort=sort, page_title="Builders")
 
 
 PAGE_SIZE = 50

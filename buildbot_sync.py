@@ -211,8 +211,8 @@ def parse_xml_log(text):
 # Buildbot API helpers
 # ---------------------------------------------------------------------------
 
-def bb_get(path):
-    url = f"{BUILDBOT_URL}{path}"
+def bb_get(path, base=BUILDBOT_URL):
+    url = f"{base}{path}"
     r = requests.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
@@ -278,6 +278,21 @@ def discover_new_builds_disk(master_root, builder, last, since_ts=None):
 
 def get_build_disk(master_root, builder, number):
     return _bb_disk(master_root, "build", master_root, builder, str(number))
+
+
+def running_builds_json(master_url):
+    """
+    {builder: [numbers]} of the builds the master is running right now, from
+    its JSON API on its own web port (not through the public reverse proxy,
+    which rate-limits /json/).
+
+    Disk mode needs this: buildbot 0.8 writes a build's pickle when the build
+    finishes (or when a PytestCmd step saves it mid-run), so a running build
+    usually has no file to discover, and when it does the file is a stale
+    snapshot. One request per sync, answered from the master's memory.
+    """
+    data = bb_get("/json/builders/", base=master_url)
+    return {name: sorted(info.get("currentBuilds") or []) for name, info in data.items()}
 
 
 def fetch_log_text(builder, number, step, log_name):
@@ -425,14 +440,22 @@ def discover_new_builds(builder, last, limit=INITIAL_BACKFILL, since_ts=None):
     return sorted(new)
 
 
-def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None, master_root=None):
+def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None,
+                 master_root=None, master_url=None, running=()):
+    """
+    `running`: build numbers the master reports as in progress (disk mode
+    only). They are read over JSON from the master's memory rather than from
+    disk, since their pickle is absent or a stale snapshot.
+    """
     upsert_builder(db, builder, category)
     last = get_last_build(db, builder)
+    running = set(running)
 
     # When backfilling by time, ignore the stored watermark so we can fill gaps
     discover_last = 0 if since_ts else last
     if master_root:
         builds_to_fetch = discover_new_builds_disk(master_root, builder, discover_last, since_ts=since_ts)
+        builds_to_fetch = sorted(set(builds_to_fetch) | {n for n in running if n > discover_last})
     else:
         builds_to_fetch = discover_new_builds(builder, discover_last, since_ts=since_ts)
     if not builds_to_fetch:
@@ -440,13 +463,18 @@ def poll_builder(db, log_root, builder, category, skip_logs=False, since_ts=None
         return 0
 
     log.info("%s: fetching builds %s", builder, builds_to_fetch)
+    in_progress = sorted(running.intersection(builds_to_fetch))
+    if in_progress:
+        log.info("%s: in progress on the master: %s", builder, in_progress)
     count = 0
     started_at = {}   # number -> start time (None if unknown) for builds we read
     finished_set = set()
     errored = set()
     for number in builds_to_fetch:
         try:
-            if master_root:
+            if master_root and number in running:
+                build_data = bb_get(f"/json/builders/{builder}/builds/{number}", base=master_url)
+            elif master_root:
                 build_data = get_build_disk(master_root, builder, number)
             else:
                 build_data = bb_get(f"/json/builders/{builder}/builds/{number}")
@@ -513,9 +541,16 @@ def _advance_watermark(builder, last, started_at, finished_set, errored, now=Non
     return new_last
 
 
-def poll_all(db, log_root, skip_logs=False, since_ts=None, master_root=None):
+def poll_all(db, log_root, skip_logs=False, since_ts=None, master_root=None, master_url=None):
+    running_all = {}
     if master_root:
         builders = {b["name"]: b for b in list_builders_disk(master_root)}
+        try:
+            running_all = running_builds_json(master_url)
+        except Exception as e:
+            # Not fatal: finished builds still come from disk; running ones
+            # just stay invisible until the master's web port answers again.
+            log.warning("can't list running builds from %s: %s", master_url, e)
     else:
         builders = bb_get("/json/builders/")
     stats = {}
@@ -523,7 +558,8 @@ def poll_all(db, log_root, skip_logs=False, since_ts=None, master_root=None):
         category = info.get("category", "")
         try:
             count = poll_builder(db, log_root, builder, category,
-                                 skip_logs=skip_logs, since_ts=since_ts, master_root=master_root)
+                                 skip_logs=skip_logs, since_ts=since_ts, master_root=master_root,
+                                 master_url=master_url, running=running_all.get(builder, ()))
         except Exception:
             log.exception("%s: poll failed", builder)
             continue
@@ -546,6 +582,10 @@ def main():
                         help="Path to buildbot master directory; if set, read builder/build "
                              "state directly from the master's on-disk pickles instead of "
                              "over HTTP, and skip downloading log files (default: %(default)r)")
+    parser.add_argument("--master-url", default="http://localhost:8099",
+                        help="With --master-root: the master's own web port, asked over JSON "
+                             "which builds are running right now, since those have no pickle "
+                             "on disk yet (default: %(default)s)")
     parser.add_argument("--days", type=int, default=0,
                         help="Backfill builds from the past N days "
                              "(default: last %d per builder)" % INITIAL_BACKFILL)
@@ -577,7 +617,7 @@ def main():
                 start = time.time()
                 before = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
                 stats = poll_all(db, args.log_root, skip_logs=skip_logs, since_ts=since_ts,
-                                 master_root=args.master_root or None)
+                                 master_root=args.master_root or None, master_url=args.master_url)
                 after = db.execute("SELECT COUNT(*) FROM builds WHERE finished IS NOT NULL").fetchone()[0]
                 run.items_synced = after - before
                 log.info("done in %.1fs (%d new finished builds)", time.time() - start, run.items_synced)
