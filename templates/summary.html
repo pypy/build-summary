@@ -52,8 +52,13 @@
 <p>No builds found within the current window.
 {% if last_build_date %}
   Most recent data: <b>{{ last_build_date }}</b>.
+  {% if suggested_days %}
   Try <a href="/summary?days={{ suggested_days }}">?days={{ suggested_days }}</a> to include it,
   or run <code>buildbot_sync.py</code> to fetch fresh builds.
+  {% else %}
+  That is outside the {{ days_max }}-day limit of this page; run
+  <code>buildbot_sync.py</code> to fetch fresh builds.
+  {% endif %}
 {% else %}
   Does the branch exist?
 {% endif %}

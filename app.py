@@ -270,6 +270,10 @@ NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "~/nightly")
 BENCH_ROOT = os.environ.get("BENCH_ROOT", "~/benchmark-results")
 BUILDBOT_URL = "https://buildbot.pypy.org"
 DAYS_DEFAULT = 14
+# Hard cap on ?days=: every finished build in the window has its logs parsed
+# (or read from OUTCOME_CACHE), so a stray crawler link like ?days=121 on a
+# cold worker is a guaranteed gunicorn timeout.
+DAYS_MAX = 60
 REVS_DEFAULT = 5
 VERSION = "0.3"
 _PRIMARY_BRANCHES_CACHE = {"branches": None, "ts": 0}
@@ -870,7 +874,7 @@ def summary():
     branch = request.args.get("branch")
     source = request.args.get("source")
     revisions = request.args.getlist("revision")
-    days = int(request.args.get("days", DAYS_DEFAULT))
+    days = min(int(request.args.get("days", DAYS_DEFAULT)), DAYS_MAX)
     max_revs = int(request.args.get("maxrev", REVS_DEFAULT))
 
     query = """
@@ -964,6 +968,8 @@ def summary():
             last_build_date = fmt_time(row["ts"])
             age_days = (datetime.datetime.now(datetime.timezone.utc).timestamp() - row["ts"]) / 86400
             suggested_days = int(age_days) + 2
+            if suggested_days > DAYS_MAX or suggested_days <= days:
+                suggested_days = None  # nothing a wider window can do
 
     primary_branches = get_primary_branches()
     compare_branches = [b for b in primary_branches if b != branch] if branch else []
@@ -974,6 +980,7 @@ def summary():
         last_build_date=last_build_date,
         suggested_days=suggested_days,
         days=days,
+        days_max=DAYS_MAX,
         revision=revisions[0] if len(revisions) == 1 else None,
         current_branch=branch or "",
         compare_branches=compare_branches,
@@ -1254,7 +1261,7 @@ def build(name, number_str):
 
     now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
     age_days = int((now_ts - b["started"]) / 86400) + 2 if b["started"] else 0
-    summary_days = max(14, age_days)
+    summary_days = min(max(14, age_days), DAYS_MAX)
     cat_param = f"&category={category}" if category else ""
     summary_url = (
         f"/summary?branch={branch}{cat_param}&days={summary_days}&prefix={name}"
@@ -1905,13 +1912,20 @@ def sync_log(run_id):
 
 @app.route("/robots.txt")
 def robots_txt():
-    """Keep crawlers off the pages that parse pytest logs per request."""
+    """
+    Keep crawlers off the pages that parse or render whole logs per request.
+    The build pages and builder histories stay crawlable; they are DB-only.
+    """
     body = "\n".join([
         "User-agent: *",
         "Disallow: /longrepr/",
         "Disallow: /summary",
         "Disallow: /compare-branch",
         "Disallow: /revision/",
+        "Disallow: /logs/",
+        "Disallow: /gha-log/",
+        "Disallow: /gha-teardown-log/",
+        "Disallow: /benchmark-results/",
         "",
     ])
     return body, 200, {"Content-Type": "text/plain; charset=utf-8"}

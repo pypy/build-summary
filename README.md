@@ -138,7 +138,16 @@ the summary and longrepr pages don't re-parse them after a worker restart. It
 is safe to delete; it refills on demand.
 
 Manage it with `systemctl {status,restart} build-summary` and read logs with
-`journalctl -u build-summary`.
+`journalctl -u build-summary`. Gunicorn logs each completed request there; a
+request whose worker hit the 60s timeout never gets a line, so look for
+`WORKER TIMEOUT` in the journal and for 502/504 entries in nginx's
+`/var/log/nginx/access.log` to find the URL that caused it.
+
+The app serves a `robots.txt` that keeps well-behaved crawlers off the pages
+that parse or render whole logs. For the ones that ignore it, the nginx site
+config (`/etc/nginx/sites-available/buildbot` on the server; a copy is kept
+at `deploy/nginx/buildbot.conf`) applies the `$bad_bot` block list and a
+per-IP `limit_req` on those same URL prefixes to build-summary.pypy.org.
 
 > The app is served as `app:app`, so gunicorn never runs the `if __name__ ==
 > "__main__"` block — only the module-level env-var config applies in
