@@ -1,5 +1,6 @@
 *.sqlite
 logs/
+outcome_cache/
 nightly/
 benchmark-results/
 __pycache__/

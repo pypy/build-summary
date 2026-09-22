@@ -50,6 +50,37 @@ def cmd_builds(master_root, builder):
     json.dump(out, sys.stdout)
 
 
+def finished_at(master_root, builder, number, build):
+    """
+    The build's real finish time, or None if it is still running.
+
+    buildbot 0.8's BuildStatus.__getstate__ stamps finished=now() into the
+    pickle of a build that is still in progress (it assumes a saved build is
+    one interrupted by a master shutdown), so getTimes()[1] on its own can't
+    be trusted. A build that really completed went through
+    Build.buildFinished(): setResults() then buildFinished(), which clears
+    currentStep. If neither happened, the pickle is a mid-build snapshot.
+
+    A snapshot written before the running master started belongs to a build
+    that really was cut short by a restart and will never finish; keep
+    buildbot's own "interrupted at" timestamp for it (the web UI shows the
+    same thing).
+    """
+    finished = build.getTimes()[1]
+    if finished is None:
+        return None
+    if build.getResults() is not None and getattr(build, "currentStep", None) is None:
+        return finished
+    try:
+        master_started = os.path.getmtime(os.path.join(master_root, "twistd.pid"))
+        pickle_written = os.path.getmtime(os.path.join(master_root, builder, str(number)))
+    except OSError:
+        return None
+    if pickle_written < master_started:
+        return finished
+    return None
+
+
 def cmd_build(master_root, builder, number):
     _add_botdir(master_root)
     path = os.path.join(master_root, builder, str(number))
@@ -70,7 +101,7 @@ def cmd_build(master_root, builder, number):
     data = {
         "number": build.getNumber(),
         "properties": build.getProperties().asList(),
-        "times": list(build.getTimes()),
+        "times": [build.getTimes()[0], finished_at(master_root, builder, number, build)],
         "results": build.getResults(),
         "steps": [step_dict(s) for s in build.getSteps()],
     }

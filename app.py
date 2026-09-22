@@ -20,9 +20,10 @@ from buildbot_sync import parse_pytest_log, parse_xml_log
 from sync_util import get_last_checked
 
 try:
-    from compression.zstd import decompress as _zstd_decompress
+    from compression.zstd import compress as _zstd_compress, decompress as _zstd_decompress
 except ImportError:
     import zstandard as _zstd
+    def _zstd_compress(data): return _zstd.ZstdCompressor().compress(data)
     def _zstd_decompress(data): return _zstd.ZstdDecompressor().decompress(data)
 
 
@@ -507,10 +508,30 @@ def _pytestlog_paths(build_id):
 _OUTCOME_PRIORITY = {"!": 3, "F": 2, "E": 2, "X": 1, "x": 1, "s": 1, ".": 0, " ": -1}
 
 
-@functools.lru_cache(maxsize=1024)
-def _get_outcomes(build_id):
-    """Return {test_name: outcome_char} for a build, merging all pytestLog steps."""
-    combined = {}
+OUTCOME_CACHE = os.environ.get(
+    "OUTCOME_CACHE", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "outcome_cache")
+)
+
+
+def _parsed_log(build_id):
+    """
+    [(test_name, outcome, longrepr), ...] from all pytestLog steps of a build,
+    in step order.
+
+    Parsing means decompressing and scanning a log of tens of thousands of
+    lines, which is what pins a gunicorn worker when crawlers walk the
+    longrepr links. The parsed form of a finished build's logs is kept on
+    disk under OUTCOME_CACHE, keyed by build id, so it survives worker
+    restarts (the in-memory lru_cache on _get_outcomes does not).
+    """
+    cache_path = os.path.join(OUTCOME_CACHE, f"{build_id}.json.zst")
+    try:
+        with open(cache_path, "rb") as f:
+            return json.loads(_zstd_decompress(f.read()))
+    except Exception:
+        pass  # missing or unreadable cache entry: re-parse and rewrite it
+
+    triples = []
     for path in _pytestlog_paths(build_id):
         try:
             text = read_log_file(path)
@@ -518,11 +539,30 @@ def _get_outcomes(build_id):
             continue
         parse = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
         try:
-            for name, outcome, _ in parse(text):
-                if _OUTCOME_PRIORITY.get(outcome, 0) > _OUTCOME_PRIORITY.get(combined.get(name), -1):
-                    combined[name] = outcome
+            triples.extend(parse(text))
         except ET.ParseError:
-            continue
+            continue  # truncated junit xml, e.g. a run killed by the pytest timeout
+
+    row = get_db().execute("SELECT finished FROM builds WHERE id = ?", (build_id,)).fetchone()
+    if triples and row and row["finished"] is not None:
+        try:
+            os.makedirs(OUTCOME_CACHE, exist_ok=True)
+            tmp = f"{cache_path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(_zstd_compress(json.dumps(triples).encode("utf-8")))
+            os.replace(tmp, cache_path)
+        except OSError:
+            pass
+    return triples
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_outcomes(build_id):
+    """Return {test_name: outcome_char} for a build, merging all pytestLog steps."""
+    combined = {}
+    for name, outcome, _ in _parsed_log(build_id):
+        if _OUTCOME_PRIORITY.get(outcome, 0) > _OUTCOME_PRIORITY.get(combined.get(name), -1):
+            combined[name] = outcome
     return combined
 
 
@@ -1133,8 +1173,14 @@ def build(name, number_str):
         sname = step["name"]
         result_code = step["result"]
         finished = step["finished"]
-        result_text = RESULT_TEXT.get(result_code, "—" if finished else "running")
-        css = RESULT_CSS.get(result_code, "")
+        if result_code in RESULT_TEXT:
+            result_text, css = RESULT_TEXT[result_code], RESULT_CSS[result_code]
+        elif step["started"] and not finished:
+            # the step buildbot is on right now: paint it yellow like buildbot does
+            result_text, css = "running", "running"
+        else:
+            # not started yet, or finished without a result (e.g. skipped)
+            result_text, css = ("—" if finished else ""), ""
         duration = fmt_duration(step["started"], finished)
         local_log_names = {ln for sn, ln in local_logs if sn == sname}
         logs = []
@@ -1248,25 +1294,18 @@ def longrepr(build_id, test_name):
 
     number_display = _display_number(build["number"], build["source"])
     longrepr_text = None
+    prefix_repr = None
     prefix = test_name + "::"
-    for path in _pytestlog_paths(build_id):
-        try:
-            text = read_log_file(path)
-        except OSError:
+    for name, _outcome, repr_text in _parsed_log(build_id):
+        if not repr_text:
             continue
-        parser = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
-        prefix_repr = None
-        for name, outcome, repr_text in parser(text):
-            if name == test_name and repr_text:
-                longrepr_text = repr_text
-                break
-            if prefix_repr is None and name.startswith(prefix) and repr_text:
-                prefix_repr = repr_text
-        if longrepr_text:
+        if name == test_name:
+            longrepr_text = repr_text
             break
-        if prefix_repr:
-            longrepr_text = prefix_repr
-            break
+        if prefix_repr is None and name.startswith(prefix):
+            prefix_repr = repr_text
+    if not longrepr_text:
+        longrepr_text = prefix_repr
 
     if not longrepr_text:
         abort(404)
@@ -1862,6 +1901,20 @@ def sync_log(run_id):
     output = row['output'] or '(no output captured)'
     title = f"{row['script']} — {fmt_time(row['started'])}"
     return render_template("sync_log.html", title=title, output=output, page_title=f"Sync log #{run_id}")
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    """Keep crawlers off the pages that parse pytest logs per request."""
+    body = "\n".join([
+        "User-agent: *",
+        "Disallow: /longrepr/",
+        "Disallow: /summary",
+        "Disallow: /compare-branch",
+        "Disallow: /revision/",
+        "",
+    ])
+    return body, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/static/<path:filename>")

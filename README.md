@@ -131,6 +131,11 @@ The unit sets the config env vars the app reads:
 | `NIGHTLY_ROOT` | `/home/pypy-worker/nightly` |
 | `BENCH_ROOT` | `/home/pypy-worker/bench_results` |
 | `BUILDBOT_MASTER_ROOT` | `/home/pypy-worker/buildbot/master` |
+| `OUTCOME_CACHE` | unset; defaults to `outcome_cache/` next to `SUMMARY_DB` |
+
+`OUTCOME_CACHE` holds the parsed form of each finished build's pytest logs so
+the summary and longrepr pages don't re-parse them after a worker restart. It
+is safe to delete; it refills on demand.
 
 Manage it with `systemctl {status,restart} build-summary` and read logs with
 `journalctl -u build-summary`.
