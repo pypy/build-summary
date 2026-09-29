@@ -86,6 +86,25 @@
 </ol>
 {% endif %}
 
+{% if gha_times %}
+<h3>Per-file test times</h3>
+{% for suite in gha_times %}
+<details{% if suite.flagged %} open{% endif %}>
+  <summary>{{ suite.suite }}{% if suite.limit %} &mdash; timeout {{ suite.limit }}s{% endif %}</summary>
+  <table class="results">
+    <tr><th>seconds</th><th class="left">file</th><th class="left">note</th></tr>
+    {% for row in suite.rows %}
+    <tr>
+      <td>{{ row.seconds }}</td>
+      <td class="left"><code>{{ row.file }}</code></td>
+      <td class="left {{ row.css }}">{{ row.note }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</details>
+{% endfor %}
+{% endif %}
+
 {% else %}
 <ol>
 {% for step in steps %}

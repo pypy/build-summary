@@ -265,7 +265,7 @@ from flask import (
     send_from_directory,
 )
 
-from sync_util import DB_PATH, LOG_ROOT, BUILDBOT_MASTER_ROOT, migrate_db
+from sync_util import DB_PATH, LOG_ROOT, BUILDBOT_MASTER_ROOT, OUTCOME_CACHE, migrate_db
 NIGHTLY_ROOT = os.environ.get("NIGHTLY_ROOT", "~/nightly")
 BENCH_ROOT = os.environ.get("BENCH_ROOT", "~/benchmark-results")
 BUILDBOT_URL = "https://buildbot.pypy.org"
@@ -308,16 +308,23 @@ VERSION_INFO = {
     "platform": sys.platform,
 }
 
-RESULT_CSS = {0: "success", 1: "warnings", 2: "failure", 4: "exception"}
-RESULT_TEXT = {0: "OK", 1: "warnings", 2: "FAILED", 4: "exception"}
+# buildbot's result codes; 3/6 also come from gha_sync's conclusion mapping
+RESULT_CSS = {0: "success", 1: "warnings", 2: "failure", 3: "skipped",
+              4: "exception", 6: "cancelled"}
+RESULT_TEXT = {0: "OK", 1: "warnings", 2: "FAILED", 3: "skipped",
+               4: "exception", 6: "cancelled"}
 OUTCOME_CSS = {
     "F": "failure",
     "!": "exception",
+    "c": "cancelled",
     "s": "skip",
     "x": "skip",
     "X": "warnings",
     ".": "success",
 }
+# Outcomes that earn a row in the summary matrix, worst first.
+ERROR_OUTCOMES = ("F", "!", "E")
+_ROW_PRIORITY = {"!": 3, "F": 2, "E": 2, "c": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -509,12 +516,7 @@ def _pytestlog_paths(build_id):
     return paths
 
 
-_OUTCOME_PRIORITY = {"!": 3, "F": 2, "E": 2, "X": 1, "x": 1, "s": 1, ".": 0, " ": -1}
-
-
-OUTCOME_CACHE = os.environ.get(
-    "OUTCOME_CACHE", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "outcome_cache")
-)
+_OUTCOME_PRIORITY = {"!": 3, "F": 2, "E": 2, "c": 1, "X": 1, "x": 1, "s": 1, ".": 0, " ": -1}
 
 
 def _parsed_log(build_id):
@@ -571,10 +573,12 @@ def _get_outcomes(build_id):
 
 
 def _outcome_counts(outcomes, tests_pass=None):
-    nF = ns = nx = ndot = 0
+    nF = ns = nx = ndot = nc = 0
     for o in outcomes.values():
-        if o in ("F", "!", "E"):
+        if o in ERROR_OUTCOMES:
             nF += 1
+        elif o == "c":
+            nc += 1
         elif o == "s":
             ns += 1
         elif o == "x":
@@ -583,7 +587,7 @@ def _outcome_counts(outcomes, tests_pass=None):
             ndot += 1
     if not outcomes and tests_pass is not None:
         ndot = tests_pass
-    return ndot, nF, ns, nx
+    return ndot, nF, ns, nx, nc
 
 
 def render_section_pre(
@@ -634,30 +638,37 @@ def render_section_pre(
                 continue
             outcomes = outcomes_by_build.get(bid, {})
             tp = (tests_pass_by_bid or {}).get(bid)
-            ndot, nF, ns, nx = _outcome_counts(outcomes, tests_pass=tp)
+            ndot, nF, ns, nx, nc = _outcome_counts(outcomes, tests_pass=tp)
             number = (bid_to_number or {}).get(bid)
             href = f"/builders/{_html.escape(full_name[bshort])}/builds/{number}" if number else f"/builders/{_html.escape(full_name[bshort])}"
             blink = f'<a class="failSummary builder" href="{href}">{_html.escape(bshort)}</a>'
-            builder_parts.append(f"{blink} [{ndot}, {nF} F, {ns} s, {nx} x]")
+            counts = f"{ndot}, {nF} F, {ns} s, {nx} x"
+            if nc:
+                counts += f", {nc} c"
+            builder_parts.append(f"{blink} [{counts}]")
         builder_info = "  ".join(builder_parts)
         lines.append(f"{bars} {rev_link}{padding}  {builder_info}  ({rev['date']})\n")
 
     bars_final = " |" * n
     lines.append(f"{bars_final}\n")
 
-    # Success row: one +/- per revision, always shown
+    # Success row: one +/- per revision, always shown. A revision whose only
+    # non-passing outcomes are cancellations gets a grey toggle, not a red one.
     success_parts = []
     for i, rev in enumerate(revisions):
         rev_str = rev["revision"]
-        has_error = any(
-            o in ("F", "!")
+        rev_outcomes = [
+            o
             for bshort, bid in builds_by_rev_builder.get(rev_str, {}).items()
             for o in outcomes_by_build.get(bid, {}).values()
-        )
-        if has_error:
+        ]
+        has_error = any(o in ("F", "!") for o in rev_outcomes)
+        has_cancel = any(o == "c" for o in rev_outcomes)
+        if has_error or has_cancel:
             link_id = f"a{section_idx}c{1 << i}"
+            cls = "failed" if has_error else "cancelled"
             success_parts.append(
-                f' <a class="failSummary failed" id="{link_id}"'
+                f' <a class="failSummary {cls}" id="{link_id}"'
                 f' href="javascript:togglestate({section_idx},{1 << i})">-</a>'
             )
         else:
@@ -675,10 +686,11 @@ def render_section_pre(
                 if bid
                 else " "
             )
-            if outcome in ("F", "!", "E"):
+            if outcome in ERROR_OUTCOMES or outcome == "c":
                 tenc = urllib.parse.quote(row["test_name"], safe="/")
+                cls = "cancelled" if outcome == "c" else "failed"
                 cells.append(
-                    f' <a class="failSummary failed" href="/longrepr/{bid}/{tenc}">{outcome}</a>'
+                    f' <a class="failSummary {cls}" href="/longrepr/{bid}/{tenc}">{outcome}</a>'
                 )
             else:
                 cells.append(f" {outcome}")
@@ -758,28 +770,29 @@ def build_sections(builds, outcomes_by_build, max_revs=REVS_DEFAULT, compare=Fal
             for rev in revisions
             for bid in builds_by_rev_builder.get(rev["revision"], {}).values()
         }
-        error_keys = {}  # (bshort, tname) -> worst outcome ("!" beats "F")
+        error_keys = {}  # (bshort, tname) -> worst outcome ("!" beats "F" beats "c")
         for bid in displayed_bids:
             bshort = bid_to_builder.get(bid)
             if bshort is None:
                 continue
             for tname, outcome in outcomes_by_build.get(bid, {}).items():
-                if outcome in ("F", "!", "E"):
+                if outcome in _ROW_PRIORITY:
                     key = (bshort, tname)
-                    if error_keys.get(key) != "!":
+                    if _ROW_PRIORITY[outcome] > _ROW_PRIORITY.get(error_keys.get(key), 0):
                         error_keys[key] = outcome
 
         matrix_rows = []
         for (bshort, tname), worst in sorted(
             error_keys.items(),
-            key=lambda kv: (0 if kv[1] == "!" else 1, _builder_sort_key(kv[0][0]), kv[0][1]),
+            # crashes first, cancellations last
+            key=lambda kv: (-_ROW_PRIORITY[kv[1]], _builder_sort_key(kv[0][0]), kv[0][1]),
         ):
             combination = 0
             for i, rev in enumerate(revisions):
                 bid = builds_by_rev_builder.get(rev["revision"], {}).get(bshort)
                 if bid:
                     outcome = _lookup_outcome(outcomes_by_build.get(bid, {}), tname)
-                    if outcome in ("F", "!", "E"):
+                    if outcome in _ROW_PRIORITY:
                         combination |= 1 << i
             matrix_rows.append(
                 {
@@ -918,7 +931,7 @@ def summary():
 
     # For builds that failed with no test outcomes, inject the failing step text
     # as a synthetic outcome so the failure is visible in the matrix.
-    failed_no_tests = [b for b in builds if b["result"] in (2, 4) and not outcomes_by_build.get(b["id"])]
+    failed_no_tests = [b for b in builds if b["result"] in (2, 4, 6) and not outcomes_by_build.get(b["id"])]
     if failed_no_tests:
         fids = [b["id"] for b in failed_no_tests]
         ph = ",".join("?" * len(fids))
@@ -938,6 +951,9 @@ def summary():
             gha_failed.setdefault(row["build_id"], []).append(row["name"])
         for b in failed_no_tests:
             bid = b["id"]
+            if b["result"] == 6:
+                outcomes_by_build[bid] = {"build cancelled": "c"}
+                continue
             labels = bb_failed.get(bid) or gha_failed.get(bid) or ["build failed"]
             outcomes_by_build[bid] = {label: "!" for label in labels}
 
@@ -1157,6 +1173,39 @@ def builder(name):
 _BUILD_NUM_RE = re.compile(r'^(\d+)([*+]?)$')
 _SUFFIX_TO_SOURCE = {'*': ("source='gha'", []), '+': ("source IN ('bb','bb-master')", [])}
 
+_TIMES_LIMIT_RE = re.compile(r"timeout (\d+)s")
+
+
+def _parse_file_times(text):
+    """Parse the workflow's file-times.md markdown table.
+
+    Returns ([{seconds, file, note, css}, ...], per-file timeout in seconds).
+    The table is small and fixed-shape (| seconds | file | note |), so a full
+    markdown parser would be overkill.
+    """
+    rows = []
+    limit = None
+    for line in text.splitlines():
+        line = line.strip()
+        if limit is None and line.startswith("#"):
+            m = _TIMES_LIMIT_RE.search(line)
+            if m:
+                limit = int(m.group(1))
+            continue
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) != 3 or not cells[0].isdigit():
+            continue  # header row or the ---:|---|--- separator
+        note = cells[2]
+        rows.append({
+            "seconds": int(cells[0]),
+            "file": cells[1],
+            "note": note,
+            "css": "failure" if "TIMED OUT" in note else ("warnings" if note else ""),
+        })
+    return rows, limit
+
 @app.route("/builders/<name>/builds/<number_str>")
 def build(name, number_str):
     """Detail page for a single build: steps, logs, test outcomes."""
@@ -1277,10 +1326,27 @@ def build(name, number_str):
             })
 
     gha_combined = None
+    gha_times = []
     if is_gha:
         idx = next((i for i, s in enumerate(steps_data) if s["name"] == "combined"), None)
         if idx is not None:
             gha_combined = steps_data.pop(idx)
+        # Per-file timings from the workflow's "Report per-file times and
+        # timeouts" step, uploaded as file-times.md inside each suite artifact.
+        for (step_name, log_name), path in sorted(local_logs.items()):
+            if log_name != "times":
+                continue
+            try:
+                rows, limit = _parse_file_times(read_log_file(os.path.join(LOG_ROOT, path)))
+            except OSError:
+                continue
+            if rows:
+                gha_times.append({
+                    "suite": step_name,
+                    "rows": rows,
+                    "limit": limit,
+                    "flagged": any(r["css"] for r in rows),
+                })
 
     raw_rev = b["revision"] or ""
     display_rev = _display_rev(raw_rev)
@@ -1309,7 +1375,7 @@ def build(name, number_str):
         slave=b["slave"] or "", reason=b["reason"] or "",
         steps=steps_data, props=props_data,
         is_gha=is_gha, gha_setup=gha_setup, gha_finalize=gha_finalize,
-        gha_combined=gha_combined,
+        gha_combined=gha_combined, gha_times=gha_times,
         page_title=f"{name} #{number}",
     )
 

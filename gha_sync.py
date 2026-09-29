@@ -31,7 +31,14 @@ from buildbot_sync import (
     set_last_build,
     upsert_builder,
 )
-from sync_util import DB_PATH, LOG_ROOT, LockHeld, SyncRun, single_instance_lock
+from sync_util import (
+    DB_PATH,
+    LOG_ROOT,
+    LockHeld,
+    SyncRun,
+    invalidate_outcome_cache,
+    single_instance_lock,
+)
 
 GITHUB_API = "https://api.github.com"
 REQUEST_TIMEOUT = 30
@@ -55,10 +62,20 @@ GHA_RESULT_MAP = {
     "success":   0,
     "failure":   2,
     "timed_out": 2,
-    "cancelled": 4,
-    "skipped":   4,
+    "cancelled": 6,
+    "skipped":   3,
     "neutral":   0,
 }
+
+# How serious each result code is. Used instead of max() when rolling job
+# results up into a build result: the codes are buildbot's, where cancelled (6)
+# and skipped (3) are numerically larger than failure (2) but mean less.
+RESULT_SEVERITY = {0: 0, 3: 1, 6: 2, 1: 3, 2: 4, 4: 5}
+
+
+def worse(a, b):
+    """Whichever of two result codes is the more serious."""
+    return a if RESULT_SEVERITY.get(a, 5) >= RESULT_SEVERITY.get(b, 5) else b
 
 
 # ---------------------------------------------------------------------------
@@ -223,9 +240,7 @@ def platform_timing_and_result(jobs, platform):
             starts.append(s)
         if f := _parse_ts(job.get("completed_at")):
             finishes.append(f)
-        code = GHA_RESULT_MAP.get(job.get("conclusion") or "", 4)
-        if code > worst:
-            worst = code
+        worst = worse(worst, GHA_RESULT_MAP.get(job.get("conclusion") or "", 4))
     if not found:
         return None, None, 2
     return (
@@ -369,7 +384,8 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
 
         # Download each suite artifact; collect raw logs and merged pytestLog text
         merged_parts = []
-        suite_logs = []  # [(suite, testrun_text, output_text, s_started, s_finished, s_result)]
+        # [(suite, testrun_text, output_text, s_started, s_finished, s_result, times_text)]
+        suite_logs = []
         bytes_total = 0
 
         for suite, art in suite_arts:
@@ -381,13 +397,15 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
                 continue
             bytes_total += len(data)
             s_started, s_finished, s_result, conclusion = job_timing(jobs, suite, platform)
-            testrun_text = output_text = ""
+            testrun_text = output_text = times_text = ""
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 names = zf.namelist()
                 if "testrun.log" in names:
                     testrun_text = zf.read("testrun.log").decode("utf-8", errors="replace")
                 if "testrun-output.log" in names:
                     output_text = zf.read("testrun-output.log").decode("utf-8", errors="replace")
+                if "file-times.md" in names:
+                    times_text = zf.read("file-times.md").decode("utf-8", errors="replace")
             if conclusion in ("cancelled", "timed_out"):
                 last_line = next(
                     (l.strip() for l in reversed(output_text.splitlines()) if l.strip()),
@@ -400,14 +418,21 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
                 detail = f"{conclusion}{duration}"
                 if last_line:
                     detail += f": {last_line}"
-                testrun_text += f"\n! {suite}/timeout\n {detail}\n"
+                # A job GitHub cancelled (nearly always concurrency's
+                # cancel-in-progress killing a superseded run) is not a test
+                # failure: record it as the "c" outcome, which the summary
+                # renders greyed out instead of red.
+                marker = "!" if conclusion == "timed_out" else "c"
+                suffix = "timeout" if conclusion == "timed_out" else "cancelled"
+                testrun_text += f"\n{marker} {suite}/{suffix}\n {detail}\n"
             # A "!" outcome (crashed/timed-out test file) doesn't necessarily
             # fail the GHA job, but it should never show as a green step.
             if s_result == 0 and _has_crash(testrun_text):
                 s_result = 2
                 log.info("  %s: job succeeded but testrun.log has a crash; marking step FAILED", suite)
             merged_parts.append(testrun_text)
-            suite_logs.append((suite, testrun_text, output_text, s_started, s_finished, s_result))
+            suite_logs.append((suite, testrun_text, output_text, s_started, s_finished,
+                               s_result, times_text))
 
         if not merged_parts:
             log.warning("  No testrun.log for %s platform=%s", builder, platform)
@@ -415,18 +440,20 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
 
         # Roll a crash-induced step failure up into the build result too, so
         # the build and combined step agree with the suite steps.
-        worst_step = max(s[5] for s in suite_logs)
-        if worst_step > result:
-            result = worst_step
+        for s in suite_logs:
+            result = worse(result, s[5])
 
         build_id = insert_build(
             db, builder, run_number, sha12, branch,
             started, finished, result, worker, run_url, source='gha',
         )
+        if reprocess:
+            invalidate_outcome_cache(build_id)
 
         # One step per suite with its raw logs
         fs_number = f"gha-{run_id}"
-        for step_number, (suite, testrun_text, output_text, s_started, s_finished, s_result) in enumerate(suite_logs):
+        for step_number, (suite, testrun_text, output_text, s_started, s_finished,
+                          s_result, times_text) in enumerate(suite_logs):
             log_names = []
             if output_text:
                 path = save_log_file(log_root, builder, fs_number, suite, "stdio", output_text)
@@ -436,6 +463,12 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
                 path = save_log_file(log_root, builder, fs_number, suite, "testrun", testrun_text)
                 insert_log(db, build_id, suite, "testrun", path)
                 log_names.append("testrun")
+            if times_text:
+                # markdown table written by the workflow's "Report per-file
+                # times and timeouts" step; the build page renders it inline
+                path = save_log_file(log_root, builder, fs_number, suite, "times", times_text)
+                insert_log(db, build_id, suite, "times", path)
+                log_names.append("times")
             db.execute(
                 """INSERT INTO steps(build_id, step_number, name, text, log_names, result, started, finished)
                    VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
@@ -461,12 +494,14 @@ def process_run(db, log_root, session, repo, run, reprocess=False):
         )
         log.info("  %s #%d: %d outcomes, %d bytes", builder, run_number, n, bytes_total)
 
-        # Store setup/teardown steps from the first matching job for this platform
-        rep_job = next(
-            (j for j in sorted(jobs, key=lambda j: j.get("name", ""))
-             if j.get("name", "").endswith(f"({platform})")),
-            None,
-        )
+        # Store setup/teardown steps from the first matching job for this
+        # platform. A job cancelled while still queued has no steps at all, so
+        # prefer one that actually ran -- otherwise a run killed by
+        # cancel-in-progress records no setup/finalize steps for the platform.
+        platform_jobs = [j for j in sorted(jobs, key=lambda j: j.get("name", ""))
+                         if j.get("name", "").endswith(f"({platform})")]
+        rep_job = next((j for j in platform_jobs if j.get("steps")),
+                       platform_jobs[0] if platform_jobs else None)
         if rep_job:
             try:
                 _store_gha_job_steps(db, build_id, log_root, builder, fs_number,

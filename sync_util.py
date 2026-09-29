@@ -22,8 +22,20 @@ import traceback
 DB_PATH = os.environ.get("SUMMARY_DB", "pypy_summary.sqlite")
 LOG_ROOT = os.environ.get("LOG_ROOT", "logs")
 BUILDBOT_MASTER_ROOT = os.path.expanduser(os.environ.get("BUILDBOT_MASTER_ROOT", "~/buildbot/master"))
+# Parsed pytestLog outcomes, cached per build id by the web app.
+OUTCOME_CACHE = os.environ.get(
+    "OUTCOME_CACHE", os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "outcome_cache")
+)
 
 OUTPUT_LIMIT = 64 * 1024  # truncate captured log at 64 KB
+
+
+def invalidate_outcome_cache(build_id):
+    """Drop the web app's cached parse of a build's logs after rewriting them."""
+    try:
+        os.remove(os.path.join(OUTCOME_CACHE, f"{build_id}.json.zst"))
+    except OSError:
+        pass
 
 
 class LockHeld(RuntimeError):
