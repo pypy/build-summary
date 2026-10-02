@@ -151,10 +151,20 @@ def insert_log(db, build_id, step_name, log_name, path):
 # Log parsing (adapted from summary.py RevisionOutcomeSet.populate)
 # ---------------------------------------------------------------------------
 
+OUTCOME_CHARS = frozenset(". F E s x X ! c".split())
+
+
 def parse_pytest_log(text):
     """
     Yields (test_name, outcome, longrepr) triples.
-    Outcome symbols: . F s x X !
+    Outcome symbols: . F E s x X ! c
+
+    An entry is "<outcome><space><test name>", with each longrepr line
+    indented by one space. A pytestLog can also carry output that the test
+    runner itself wrote straight to the log -- compiler command lines from the
+    cffi tests, say -- and those lines match neither shape. Skipping them
+    matters: taking line[0] as an outcome and line[2:] as a name turns a line
+    like "cc -pthread ..." into a cancelled test named "-pthread ...".
     """
     kind = None
     name = None
@@ -169,10 +179,14 @@ def parse_pytest_log(text):
         if not line:
             continue
         if line[0] == ' ':
-            longrepr_lines.append(line[1:])
+            if kind is not None:
+                longrepr_lines.append(line[1:])
             continue
         if kind is not None:
             yield _flush(name, kind, longrepr_lines)
+            kind = None
+        if len(line) < 3 or line[0] not in OUTCOME_CHARS or line[1] != ' ':
+            continue    # runner output, not an outcome line
         kind = line[0]
         name = line[2:].rstrip()
         longrepr_lines = []

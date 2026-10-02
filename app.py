@@ -491,8 +491,14 @@ def _master_log_path(builder, number, step_name, log_name):
 
 def _pytestlog_paths(build_id):
     """
-    Return ordered list of absolute pytestLog paths for a build.
+    Return ordered (path, reader) pairs for a build's pytestLogs.
     Priority: LOG_ROOT (DB entries) → BUILDBOT_MASTER_ROOT.
+
+    The reader differs per source: a master log is netstring-framed whether or
+    not buildbot has got round to bz2-compressing it yet, so it always needs
+    _read_master_log. read_log_file unframes only the compressed ones, and
+    would hand back an uncompressed master log with its chunk headers spliced
+    into the middle of log lines.
     """
     db = get_db()
     rows = db.execute(
@@ -500,7 +506,7 @@ def _pytestlog_paths(build_id):
         (build_id,),
     ).fetchall()
     paths = [
-        os.path.join(LOG_ROOT, row["path"]) for row in rows
+        (os.path.join(LOG_ROOT, row["path"]), read_log_file) for row in rows
         if os.path.exists(os.path.join(LOG_ROOT, row["path"]))
     ]
     if not paths and BUILDBOT_MASTER_ROOT and os.path.isdir(BUILDBOT_MASTER_ROOT):
@@ -512,7 +518,7 @@ def _pytestlog_paths(build_id):
                 BUILDBOT_MASTER_ROOT, build_row["builder"],
                 f"{build_row['number']}-log-*-pytestLog*",
             )
-            paths = sorted(glob.glob(pattern))
+            paths = [(p, _read_master_log) for p in sorted(glob.glob(pattern))]
     return paths
 
 
@@ -538,9 +544,9 @@ def _parsed_log(build_id):
         pass  # missing or unreadable cache entry: re-parse and rewrite it
 
     triples = []
-    for path in _pytestlog_paths(build_id):
+    for path, reader in _pytestlog_paths(build_id):
         try:
-            text = read_log_file(path)
+            text = reader(path)
         except OSError:
             continue
         parse = parse_xml_log if text.lstrip().startswith("<?xml") else parse_pytest_log
